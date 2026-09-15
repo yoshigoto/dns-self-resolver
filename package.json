@@ -4,6 +4,9 @@
   "description": "OS のフルサービスリゾルバに依存せず、ルートサーバーから自前で NS 名/IP を解決する DNS クエリユーティリティ",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=18"
   },

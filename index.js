@@ -60,9 +60,37 @@ export function setCacheEntry(dnsResponseCache, cacheKey, value, ttlMs = DNS_CAC
     });
 }
 
-export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS') {
+function normalizeQueryOptions(options, defaults = {}) {
+    if (typeof options === 'boolean') {
+        return { ...defaults, useEdns: options };
+    }
+    return { ...defaults, ...(options || {}) };
+}
+
+function getDnsCacheKey(serverIp, qType, domain, options) {
+    return `${serverIp}|${qType}|${domain}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}`;
+}
+
+function getAdditionals(options) {
+    if (!options.useEdns) return [];
+    return [{
+        type: 'OPT',
+        name: '.',
+        udpPayloadSize: options.udpPayloadSize,
+        flags: options.dnssecOk ? dnsPacket.DNSSEC_OK : 0
+    }];
+}
+
+export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = {}) {
+    const options = normalizeQueryOptions(queryOptions, {
+        useEdns: true,
+        dnssecOk: false,
+        udpPayloadSize: 1232,
+        timeoutMs: 5000
+    });
+
     return new Promise((resolve) => {
-        const cacheKey = `${serverIp}|${qType}|${domain}`;
+        const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
         const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
         // 以前に同じサーバー・タイプ・ドメインに対して問い合わせ済みなら、即時復元
         if (cachedResult) {
@@ -86,7 +114,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                 type: 'query',
                 id: Math.floor(Math.random() * 65534),
                 questions: [{ type: qType, name: domain }],
-                additionals: [{ type: 'OPT', name: '.', udpPayloadSize: 1232 }]
+                additionals: getAdditionals(options)
             });
 
             socket = net.createConnection({ host: serverIp, port: 53 }, () => {
@@ -97,7 +125,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                 const timeoutResult = { error: 'TIMEOUT', transport: 'tcp' };
                 setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
                 finish(timeoutResult);
-            }, 5000);
+            }, options.timeoutMs);
 
             socket.on('error', (err) => {
                 const socketError = { error: 'SOCKET_ERROR', detail: err.message, transport: 'tcp' };
@@ -137,9 +165,16 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
     });
 }
 
-export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', useEdns = true) {
+export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = true) {
+    const options = normalizeQueryOptions(queryOptions, {
+        useEdns: true,
+        dnssecOk: false,
+        udpPayloadSize: 1232,
+        timeoutMs: 5000
+    });
+
     return new Promise((resolve) => {
-        const cacheKey = `${serverIp}|${qType}|${domain}`;
+        const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
         const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
         // 以前に同じサーバー・タイプ・ドメインに対して問い合わせ済みなら、即時復元
         if (cachedResult) {
@@ -164,7 +199,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
                 type: 'query',
                 id: Math.floor(Math.random() * 65534),
                 questions: [{ type: qType, name: domain }],
-                additionals: useEdns ? [{ type: 'OPT', name: '.', udpPayloadSize: 1232 }] : []
+                additionals: getAdditionals(options)
             });
 
             client.send(buf, 0, buf.length, 53, serverIp, (err) => {
@@ -184,7 +219,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
             const timeoutResult = { error: 'TIMEOUT', transport: 'udp' };
             setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
             return finish(timeoutResult);
-        }, 5000);
+        }, options.timeoutMs);
 
         client.on('error', (err) => {
             const socketError = { error: 'SOCKET_ERROR', detail: err.message, transport: 'udp' };
@@ -195,10 +230,14 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
         client.on('message', (msg) => {
             try {
                 const decoded = dnsPacket.decode(msg);
-                if (decoded.rcode === 'FORMERR' && useEdns) {
+                if (decoded.rcode === 'FORMERR' && options.useEdns) {
                     if (timer) clearTimeout(timer);
                     try { client.close(); } catch (e) {}
-                    return queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType, false)
+                    return queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType, {
+                        ...options,
+                        useEdns: false,
+                        dnssecOk: false
+                    })
                         .then(result => finish({ ...result, retryWithoutEdns: true }));
                 }
                 const answers = decoded.answers || [];
@@ -208,7 +247,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
                 const isTruncated = (decoded.flags & TC_FLAG) !== 0;
 
                 if (isTruncated) {
-                    const fallback = () => queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType)
+                    const fallback = () => queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType, options)
                         .then((tcpResult) => {
                             return finish({
                                 ...tcpResult,
@@ -272,16 +311,26 @@ export function cacheNameserverIPs(hostname, ips, ttlMs = NAMESERVER_IP_CACHE_TT
 // ルートサーバーから委任を辿って name の qType レコードを自己解決する (フルサービスリゾルバのキャッシュを経由しない)。
 export async function resolveRecordFromRoot(name, qType, dnsResponseCache, dependencies = {}) {
     const queryUDP = dependencies.queryDirectlyUDP || queryDirectlyUDP;
+    const resolveIPv4 = dependencies.resolveHostnameIPv4Self || resolveHostnameIPv4Self;
     let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
     let candidateQueue = [];
+
+    const useNextCandidate = async () => {
+        while (candidateQueue.length > 0) {
+            const candidate = candidateQueue.shift();
+            const ip = candidate.ip || await resolveIPv4(candidate.nsName, dependencies);
+            if (ip) {
+                currentServerIp = ip;
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (let depth = 0; depth < 10; depth++) {
         const res = await queryUDP(name, currentServerIp, dnsResponseCache, qType);
         if (res.error) {
-            if (candidateQueue.length > 0) {
-                currentServerIp = candidateQueue.shift();
-                continue;
-            }
+            if (await useNextCandidate()) continue;
             return [];
         }
 
@@ -299,10 +348,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
 
         const nsRecords = (res.authorities || []).filter(r => r.type === 'NS');
         if (nsRecords.length === 0) {
-            if (candidateQueue.length > 0) {
-                currentServerIp = candidateQueue.shift();
-                continue;
-            }
+            if (await useNextCandidate()) continue;
             return [];
         }
 
@@ -321,7 +367,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
             .map(nsName => ({ nsName, ip: glueByNsName.get(nsName) || null }))
             .sort((a, b) => (a.ip ? 0 : 1) - (b.ip ? 0 : 1));
         const chosen = candidates.shift();
-        candidateQueue = candidates.filter(candidate => candidate.ip).map(candidate => candidate.ip);
+        candidateQueue = candidates;
 
         if (chosen.ip) {
             currentServerIp = chosen.ip;
@@ -329,12 +375,9 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
         }
 
         // グルーが無い NS 名は再帰的に自己解決する (循環参照は resolveHostnameIPv4Self 側で検出)
-        const resolvedIp = await resolveHostnameIPv4Self(chosen.nsName, dependencies);
+        const resolvedIp = await resolveIPv4(chosen.nsName, dependencies);
         if (!resolvedIp) {
-            if (candidateQueue.length > 0) {
-                currentServerIp = candidateQueue.shift();
-                continue;
-            }
+            if (await useNextCandidate()) continue;
             return [];
         }
         currentServerIp = resolvedIp;

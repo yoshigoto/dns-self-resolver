@@ -18,7 +18,16 @@ import { queryDirectlyUDP, resolveServerIPs, normalizeDnsName } from 'dns-self-r
 
 const cache = new Map();
 const res = await queryDirectlyUDP('example.com', '198.41.0.4', cache, 'NS');
+
+const dnssecRes = await queryDirectlyUDP('com', '198.41.0.4', cache, 'DS', {
+	useEdns: true,
+	dnssecOk: true,
+	udpPayloadSize: 1232,
+	timeoutMs: 5000
+});
 ```
+
+`queryDirectlyTCP` の第5引数にも同じオプションオブジェクトを指定できます。`queryDirectlyUDP` の従来の第5引数 (`useEdns` の boolean) も引き続き利用できます。UDP応答の `TC` フラグによるTCPフォールバックではオプションが維持され、キャッシュはEDNSとDNSSEC OK (DO) の有無ごとに分離されます。
 
 依存性注入 (`dependencies` 引数) でクエリ関数を差し替えられるため、ユニットテストではモックを渡してネットワークアクセスなしに検証できます。
 
