@@ -9,6 +9,7 @@ DNS パケットの送受信・キャッシュ・NS 名前解決ロジックを�
 - `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (循環参照検出・グルーレコードキャッシュ付き)
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
+- `getReferralAddressRecords`: 委任応答の追加セクションから、次の問い合わせ先選定に使う参照アドレス (out-of-bailiwick を含む) を抽出。`isInBailiwickGlue` による正式な glue 判定とは区別される
 - `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ
 
 ## 使い方

@@ -294,7 +294,7 @@ test('TCP query finishes after receiving a complete message without waiting for 
     }
 });
 
-test('out-of-bailiwick glue is ignored and the next nameserver is resolved', async () => {
+test('a candidate without any referral address falls back to recursive self-resolution', async () => {
     const calls = [];
     const resolvedHosts = [];
     const result = await resolveRecordFromRoot('host.glue-fallback.test', 'A', new Map(), {
@@ -307,8 +307,7 @@ test('out-of-bailiwick glue is ignored and the next nameserver is resolved', asy
                         { name: 'glue-fallback.test', type: 'NS', data: 'ns2.external.test' }
                     ],
                     additionals: [
-                        { name: 'ns1.glue-fallback.test', type: 'A', data: '192.0.2.11' },
-                        { name: 'ns2.external.test', type: 'A', data: '192.0.2.12' }
+                        { name: 'ns1.glue-fallback.test', type: 'A', data: '192.0.2.11' }
                     ]
                 };
             }
@@ -327,4 +326,39 @@ test('out-of-bailiwick glue is ignored and the next nameserver is resolved', asy
     assert.deepEqual(result, ['192.0.2.30']);
     assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.0.2.11', '192.0.2.20']);
     assert.deepEqual(resolvedHosts, ['ns2.external.test']);
+});
+
+test('out-of-bailiwick referral address (root -> com) is used without recursive self-resolution', async () => {
+    const calls = [];
+    const resolvedHosts = [];
+    // a.gtld-servers.net はルートから見て out-of-bailiwick (com. 配下ではない) だが、
+    // 探索用の参照アドレスとして additionals に含まれる。
+    const result = await resolveRecordFromRoot('example.com', 'NS', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'com', type: 'NS', data: 'a.gtld-servers.net' }
+                    ],
+                    additionals: [
+                        { name: 'a.gtld-servers.net', type: 'A', data: '192.5.6.30' }
+                    ]
+                };
+            }
+            assert.equal(serverIp, '192.5.6.30');
+            return {
+                answers: [{ name: domain, type: 'NS', data: 'ns1.example.com' }]
+            };
+        },
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(hostname);
+            return null;
+        }
+    });
+
+    assert.deepEqual(result, ['ns1.example.com']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.30']);
+    // 参照アドレスがそのまま使われ、循環しうる自己解決へは進まない。
+    assert.deepEqual(resolvedHosts, []);
 });
