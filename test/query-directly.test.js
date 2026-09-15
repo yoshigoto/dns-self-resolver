@@ -6,6 +6,11 @@ import net from 'node:net';
 import dnsPacket from 'dns-packet';
 
 import {
+    hasParentChildRelationship,
+    isInBailiwickGlue,
+    isIPv6,
+    isSubdomainOrEqual,
+    normalizeDnsName,
     queryDirectlyTCP,
     queryDirectlyUDP,
     resolveRecordFromRoot,
@@ -79,6 +84,55 @@ function mockUdp(onQuery) {
         dgram.createSocket = originalCreateSocket;
     };
 }
+
+test('DNS 名を小文字化し、末尾ドットを除去する', () => {
+    assert.equal(normalizeDnsName(' NS1.Example.COM. '), 'ns1.example.com');
+    assert.equal(normalizeDnsName(null), '');
+});
+
+test('サブドメインまたは同一名だけを親子関係として判定する', () => {
+    assert.equal(isSubdomainOrEqual('www.example.com', 'example.com'), true);
+    assert.equal(isSubdomainOrEqual('example.com.', 'example.com'), true);
+    assert.equal(isSubdomainOrEqual('example.com', 'ample.com'), false);
+    assert.equal(isSubdomainOrEqual('example.net', 'example.com'), false);
+    assert.equal(hasParentChildRelationship('www.example.com', 'example.com'), true);
+    assert.equal(hasParentChildRelationship('example.com', 'www.example.com'), true);
+    assert.equal(hasParentChildRelationship('example.net', 'example.com'), false);
+});
+
+test('IPv4 と IPv6 を識別する', () => {
+    assert.equal(isIPv6('2001:db8::53'), true);
+    assert.equal(isIPv6('192.0.2.53'), false);
+});
+
+test('in-domain glue だけを採用する', () => {
+    const nsNames = ['ns1.child.example.com', 'ns2.external.example.net'];
+
+    assert.equal(
+        isInBailiwickGlue(
+            { type: 'A', name: 'ns1.child.example.com' },
+            nsNames,
+            'child.example.com'
+        ),
+        true
+    );
+    assert.equal(
+        isInBailiwickGlue(
+            { type: 'AAAA', name: 'ns2.external.example.net' },
+            nsNames,
+            'child.example.com'
+        ),
+        false
+    );
+    assert.equal(
+        isInBailiwickGlue(
+            { type: 'TXT', name: 'ns1.child.example.com' },
+            nsNames,
+            'child.example.com'
+        ),
+        false
+    );
+});
 
 test('queryDirectlyUDP sets DO and separates DO/EDNS cache entries', async () => {
     const queries = [];
