@@ -14,6 +14,9 @@ import {
     queryDirectlyTCP,
     queryDirectlyUDP,
     resolveRecordFromRoot,
+    resolveServerIPs,
+    resolveHostnameIPv4Self,
+    resolveRecordFromServer,
     ROOT_SERVER_BOOTSTRAP_IP
 } from '../index.js';
 
@@ -361,4 +364,119 @@ test('out-of-bailiwick referral address (root -> com) is used without recursive 
     assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.30']);
     // 参照アドレスがそのまま使われ、循環しうる自己解決へは進まない。
     assert.deepEqual(resolvedHosts, []);
+});
+
+test('resolveServerIPs returns knownAddresses without root resolution', async () => {
+    const knownAddresses = {
+        'ns1.yodobashi.com': '219.127.199.121',
+        'ns2.yodobashi.com': ['219.127.199.122', '2001:db8::122']
+    };
+
+    const ips1 = await resolveServerIPs('ns1.yodobashi.com', { knownAddresses });
+    assert.deepEqual(ips1, ['219.127.199.121']);
+
+    const ips2 = await resolveServerIPs('ns2.yodobashi.com', { knownAddresses });
+    assert.deepEqual(ips2, ['219.127.199.122', '2001:db8::122']);
+});
+
+test('resolveRecordFromRoot uses knownAddresses for referral candidates missing glue', async () => {
+    const calls = [];
+    const resolvedHosts = [];
+    const knownAddresses = new Map([
+        ['ns1.missing-glue.test', '192.0.2.77']
+    ]);
+
+    const result = await resolveRecordFromRoot('target.missing-glue.test', 'A', new Map(), {
+        knownAddresses,
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'missing-glue.test', type: 'NS', data: 'ns1.missing-glue.test' }
+                    ],
+                    additionals: [] // no glue in referral
+                };
+            }
+            assert.equal(serverIp, '192.0.2.77');
+            return {
+                answers: [{ name: domain, type: 'A', data: '192.0.2.88' }]
+            };
+        },
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(hostname);
+            return null;
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.88']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.0.2.77']);
+    assert.deepEqual(resolvedHosts, []);
+});
+
+test('concurrent resolution of the same NS name shares promise without returning null', async () => {
+    let queryCount = 0;
+    const mockQueryUDP = async (domain, serverIp, cache, qType) => {
+        // slight delay to simulate async network
+        await new Promise(r => setTimeout(r, 10));
+        queryCount++;
+        return {
+            flags: 1024,
+            answers: [{ name: domain, type: qType, data: qType === 'A' ? '192.0.2.55' : '2001:db8::55' }]
+        };
+    };
+
+    const [res1, res2, res3] = await Promise.all([
+        resolveServerIPs('concurrent-ns.example.com', { queryDirectlyUDP: mockQueryUDP }),
+        resolveServerIPs('concurrent-ns.example.com', { queryDirectlyUDP: mockQueryUDP }),
+        resolveServerIPs('concurrent-ns.example.com', { queryDirectlyUDP: mockQueryUDP })
+    ]);
+
+    assert.deepEqual(res1, ['192.0.2.55', '2001:db8::55']);
+    assert.deepEqual(res2, ['192.0.2.55', '2001:db8::55']);
+    assert.deepEqual(res3, ['192.0.2.55', '2001:db8::55']);
+    // All 3 callers shared the singleflight resolution
+    assert.equal(queryCount, 2); // 1 for A and 1 for AAAA
+});
+
+test('cycle in NS self-resolution properly returns null', async () => {
+    // ns1.cyclic.test delegates to ns1.cyclic.test with no glue
+    const mockQueryUDP = async (domain, serverIp, cache, qType) => {
+        return {
+            authorities: [
+                { name: 'cyclic.test', type: 'NS', data: 'ns1.cyclic.test' }
+            ],
+            additionals: []
+        };
+    };
+
+    const result = await resolveServerIPs('ns1.cyclic.test', { queryDirectlyUDP: mockQueryUDP });
+    assert.equal(result, null);
+});
+
+test('resolveRecordFromServer queries specified server for A and AAAA', async () => {
+    const queries = [];
+    const mockQueryUDP = async (domain, serverIp, cache, qType) => {
+        queries.push({ domain, serverIp, qType });
+        if (qType === 'A') {
+            return {
+                answers: [{ name: domain, type: 'A', data: '192.0.2.99' }]
+            };
+        }
+        if (qType === 'AAAA') {
+            return {
+                answers: [{ name: domain, type: 'AAAA', data: '2001:db8::99' }]
+            };
+        }
+        return { answers: [] };
+    };
+
+    const ips = await resolveRecordFromServer('auth.example.com', '192.0.2.1', ['A', 'AAAA'], new Map(), {
+        queryDirectlyUDP: mockQueryUDP
+    });
+
+    assert.deepEqual(ips, ['192.0.2.99', '2001:db8::99']);
+    assert.equal(queries.length, 2);
+    assert.equal(queries[0].serverIp, '192.0.2.1');
+    assert.equal(queries[1].serverIp, '192.0.2.1');
 });

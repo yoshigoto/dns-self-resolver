@@ -4,10 +4,29 @@ OS のスタブリゾルバ (フルサービスリゾルバ) に依存せず、�
 [dns-delegation-check](https://github.com/) と [dnssec-validator](https://github.com/yoshigoto/dnssec-validator) の間で重複していた、
 DNS パケットの送受信・キャッシュ・NS 名前解決ロジックを切り出したものです。
 
+## インストール
+
+SSH 鍵の設定不要な HTTPS URL 経由でインストールできます。
+
+```bash
+npm install git+https://github.com/yoshigoto/dns-self-resolver.git
+```
+
+`package.json` の dependencies:
+
+```json
+{
+  "dependencies": {
+    "dns-self-resolver": "git+https://github.com/yoshigoto/dns-self-resolver.git"
+  }
+}
+```
+
 ## 提供する機能
 
 - `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信
-- `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (循環参照検出・グルーレコードキャッシュ付き)
+- `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
+- `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・`knownAddresses` や共有キャッシュ対応)
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
 - `getReferralAddressRecords`: 委任応答の追加セクションから、次の問い合わせ先選定に使う参照アドレス (out-of-bailiwick を含む) を抽出。`isInBailiwickGlue` による正式な glue 判定とは区別される
 - `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ

@@ -298,7 +298,8 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
 export const ROOT_SERVER_BOOTSTRAP_IP = '198.41.0.4';
 export const NAMESERVER_IP_CACHE_TTL = 300000; // レコードに TTL が無い場合のフォールバック
 const nameserverIpCache = new Map(); // 正規化ホスト名 -> { ips, expiresAt }
-const inFlightNsSelfResolutions = new Set(); // グルー不足による再帰解決の循環参照検出用
+const inFlightServerResolutions = new Map(); // 同一ホスト名の並行解決合流用 (Singleflight)
+const inFlightIpv4Resolutions = new Map();   // 同一ホスト名の並行解決合流用 (Singleflight)
 
 export function getCachedNameserverIPs(hostname) {
     const key = normalizeDnsName(hostname);
@@ -314,6 +315,54 @@ export function getCachedNameserverIPs(hostname) {
 export function cacheNameserverIPs(hostname, ips, ttlMs = NAMESERVER_IP_CACHE_TTL) {
     if (!hostname || !ips || ips.length === 0) return;
     nameserverIpCache.set(normalizeDnsName(hostname), { ips, expiresAt: Date.now() + ttlMs });
+}
+
+export function getKnownAddress(knownAddresses, hostname, family = 'any') {
+    if (!knownAddresses || !hostname) return null;
+    const normalized = normalizeDnsName(hostname);
+    let val = null;
+    if (knownAddresses instanceof Map) {
+        val = knownAddresses.get(normalized) || knownAddresses.get(hostname);
+    } else if (typeof knownAddresses === 'object') {
+        val = knownAddresses[normalized] || knownAddresses[hostname];
+    }
+    if (!val) return null;
+    const list = Array.isArray(val) ? val : [val];
+    if (family === 'A' || family === 'IPv4') {
+        const v4 = list.filter(ip => !isIPv6(ip));
+        return v4.length > 0 ? v4 : null;
+    }
+    if (family === 'AAAA' || family === 'IPv6') {
+        const v6 = list.filter(ip => isIPv6(ip));
+        return v6.length > 0 ? v6 : null;
+    }
+    return list.length > 0 ? list : null;
+}
+
+// 指定されたサーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
+export async function resolveRecordFromServer(
+    name,
+    serverIp,
+    qTypes = ['A', 'AAAA'],
+    dnsResponseCache = new Map(),
+    queryOptions = {}
+) {
+    const types = Array.isArray(qTypes) ? qTypes : [qTypes || 'A'];
+    const options = normalizeQueryOptions(queryOptions);
+    const queryUDP = options.queryDirectlyUDP || queryDirectlyUDP;
+    const cache = dnsResponseCache || new Map();
+
+    const results = await Promise.all(
+        types.map(async (type) => {
+            const res = await queryUDP(name, serverIp, cache, type, options);
+            if (res?.error || !res?.answers) return [];
+            return res.answers
+                .filter(record => record.type === type && normalizeDnsName(record.name) === normalizeDnsName(name))
+                .map(record => record.data);
+        })
+    );
+
+    return results.flat();
 }
 
 // ルートサーバーから委任を辿って name の qType レコードを自己解決する (フルサービスリゾルバのキャッシュを経由しない)。
@@ -371,8 +420,16 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
             });
 
         // 参照アドレスを持つ候補を優先し、無い候補は捨てずにフォールバック用に保持する。
+        // knownAddresses が指定されていれば referral アドレスがない候補の事前解決アドレスとしても参照する。
         const candidates = nsNames
-            .map(nsName => ({ nsName, ip: referralAddressByNsName.get(nsName) || null }))
+            .map(nsName => {
+                let ip = referralAddressByNsName.get(nsName) || null;
+                if (!ip && dependencies.knownAddresses) {
+                    const known = getKnownAddress(dependencies.knownAddresses, nsName, 'A');
+                    if (known && known.length > 0) ip = known[0];
+                }
+                return { nsName, ip };
+            })
             .sort((a, b) => (a.ip ? 0 : 1) - (b.ip ? 0 : 1));
         const chosen = candidates.shift();
         candidateQueue = candidates;
@@ -397,26 +454,46 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
 // NS 名の IP アドレス解決専用の入り口。グルー不足時の再帰呼び出しで循環参照を検出する。
 export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const normalized = normalizeDnsName(hostname);
-    if (net.isIP(normalized)) return normalized;
+    if (net.isIP(normalized)) {
+        return isIPv6(normalized) ? null : normalized;
+    }
+
+    const known = getKnownAddress(dependencies.knownAddresses, normalized, 'A');
+    if (known && known.length > 0) return known[0];
 
     const cached = getCachedNameserverIPs(normalized);
-    if (cached && cached.length > 0) return cached[0];
+    if (cached && cached.length > 0) {
+        const v4 = cached.find(ip => !isIPv6(ip));
+        if (v4) return v4;
+    }
 
-    if (inFlightNsSelfResolutions.has(normalized)) {
+    const resolvingStack = dependencies.resolvingStack || new Set();
+    if (resolvingStack.has(normalized)) {
         return null; // 循環参照 (グルーレコード不足の可能性)
     }
 
-    inFlightNsSelfResolutions.add(normalized);
-    try {
-        const dnsResponseCache = new Map();
-        const ips = await resolveRecordFromRoot(normalized, 'A', dnsResponseCache, dependencies);
+    if (inFlightIpv4Resolutions.has(normalized)) {
+        return inFlightIpv4Resolutions.get(normalized);
+    }
+
+    const nextStack = new Set(resolvingStack).add(normalized);
+    const childDependencies = { ...dependencies, resolvingStack: nextStack };
+
+    const promise = (async () => {
+        const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
+        const ips = await resolveRecordFromRoot(normalized, 'A', dnsResponseCache, childDependencies);
         if (ips.length > 0) {
             cacheNameserverIPs(normalized, ips);
             return ips[0];
         }
         return null;
+    })();
+
+    inFlightIpv4Resolutions.set(normalized, promise);
+    try {
+        return await promise;
     } finally {
-        inFlightNsSelfResolutions.delete(normalized);
+        inFlightIpv4Resolutions.delete(normalized);
     }
 }
 
@@ -425,25 +502,40 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
     const normalized = normalizeDnsName(nsName);
     if (net.isIP(normalized)) return [normalized];
 
+    const known = getKnownAddress(dependencies.knownAddresses, normalized);
+    if (known && known.length > 0) return known;
+
     const cached = getCachedNameserverIPs(normalized);
     if (cached) return cached;
 
-    if (inFlightNsSelfResolutions.has(normalized)) {
+    const resolvingStack = dependencies.resolvingStack || new Set();
+    if (resolvingStack.has(normalized)) {
         return null; // 循環参照 (グルーレコード不足の可能性)
     }
 
-    inFlightNsSelfResolutions.add(normalized);
-    try {
-        const dnsResponseCache = new Map();
+    if (inFlightServerResolutions.has(normalized)) {
+        return inFlightServerResolutions.get(normalized);
+    }
+
+    const nextStack = new Set(resolvingStack).add(normalized);
+    const childDependencies = { ...dependencies, resolvingStack: nextStack };
+
+    const promise = (async () => {
+        const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
         const [v4, v6] = await Promise.all([
-            resolveRecordFromRoot(normalized, 'A', dnsResponseCache, dependencies),
-            resolveRecordFromRoot(normalized, 'AAAA', dnsResponseCache, dependencies)
+            resolveRecordFromRoot(normalized, 'A', dnsResponseCache, childDependencies),
+            resolveRecordFromRoot(normalized, 'AAAA', dnsResponseCache, childDependencies)
         ]);
         const ips = [...v4, ...v6];
         if (ips.length === 0) return null;
         cacheNameserverIPs(normalized, ips);
         return ips;
+    })();
+
+    inFlightServerResolutions.set(normalized, promise);
+    try {
+        return await promise;
     } finally {
-        inFlightNsSelfResolutions.delete(normalized);
+        inFlightServerResolutions.delete(normalized);
     }
 }
