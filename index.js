@@ -44,8 +44,31 @@ export function getReferralAddressRecords(additionals, nsNames) {
 export const DNS_CACHE_TTL = {
     success: 30000,
     transient: 2000,
-    timeout: Infinity
+    // 恒久障害と誤認しないよう、タイムアウトも短命にキャッシュする (Infinity は不可)
+    timeout: 2000
 };
+
+// レコード TTL (秒) と上限 (ms) の小さい方をキャッシュ期間として採用する
+function computeSuccessTtlMs(decoded, capMs = DNS_CACHE_TTL.success) {
+    const records = [...(decoded?.answers || []), ...(decoded?.authorities || [])];
+    const ttlSeconds = records
+        .map(record => record.ttl)
+        .filter(ttl => typeof ttl === 'number' && ttl >= 0);
+    if (ttlSeconds.length === 0) return capMs;
+    return Math.min(Math.min(...ttlSeconds) * 1000, capMs);
+}
+
+function buildDnsError(code, { domain, serverIp, qType, transport, detail, retryable }) {
+    return {
+        error: code,
+        name: domain,
+        serverIp,
+        qType,
+        transport,
+        retryable,
+        ...(detail !== undefined ? { detail } : {})
+    };
+}
 
 export function getCacheEntry(dnsResponseCache, cacheKey) {
     const entry = dnsResponseCache.get(cacheKey);
@@ -89,6 +112,15 @@ function getAdditionals(options) {
     }];
 }
 
+// 遅延して届いた別クエリの応答や偽装応答を拾わないよう、id と question を照合する
+function isMatchingResponse(decoded, queryId, domain, qType) {
+    if (decoded.id !== queryId) return false;
+    const question = decoded.questions?.[0];
+    // FORMERR 等では question セクションが省略される実装があるため、その場合は id 一致のみで許容する
+    if (!question) return true;
+    return question.type === qType && normalizeDnsName(question.name) === normalizeDnsName(domain);
+}
+
 export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = {}) {
     const options = normalizeQueryOptions(queryOptions, {
         useEdns: true,
@@ -117,10 +149,12 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
             resolve(result);
         };
 
+        const queryId = Math.floor(Math.random() * 65534);
+
         try {
             const tcpBuf = dnsPacket.streamEncode({
                 type: 'query',
-                id: Math.floor(Math.random() * 65534),
+                id: queryId,
                 questions: [{ type: qType, name: domain }],
                 additionals: getAdditionals(options)
             });
@@ -130,13 +164,13 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
             });
 
             timer = setTimeout(() => {
-                const timeoutResult = { error: 'TIMEOUT', transport: 'tcp' };
+                const timeoutResult = buildDnsError('TIMEOUT', { domain, serverIp, qType, transport: 'tcp', retryable: true });
                 setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
                 finish(timeoutResult);
             }, options.timeoutMs);
 
             socket.on('error', (err) => {
-                const socketError = { error: 'SOCKET_ERROR', detail: err.message, transport: 'tcp' };
+                const socketError = buildDnsError('SOCKET_ERROR', { domain, serverIp, qType, transport: 'tcp', detail: err.message, retryable: true });
                 setCacheEntry(dnsResponseCache, cacheKey, socketError, DNS_CACHE_TTL.transient);
                 finish(socketError);
             });
@@ -155,18 +189,24 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                         if (!decoded) break;
 
                         receivedData = receivedData.subarray(2 + msgLength);
+
+                        // 遅延・不正な応答を受理しないよう、id と質問内容を照合する
+                        if (!isMatchingResponse(decoded, queryId, domain, qType)) {
+                            continue; // このメッセージは破棄し、後続データを引き続き待つ
+                        }
+
                         const tcpSuccess = { ...decoded, transport: 'tcp' };
-                        setCacheEntry(dnsResponseCache, cacheKey, tcpSuccess, DNS_CACHE_TTL.success);
+                        setCacheEntry(dnsResponseCache, cacheKey, tcpSuccess, computeSuccessTtlMs(decoded));
                         return finish(tcpSuccess);
                     } catch (e) {
-                        const decodeError = { error: 'DECODE_ERROR', detail: e.message, transport: 'tcp' };
+                        const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'tcp', detail: e.message, retryable: false });
                         setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
                         return finish(decodeError);
                     }
                 }
             });
         } catch (e) {
-            const sendError = { error: 'SEND_ERROR', detail: e.message, transport: 'tcp' };
+            const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'tcp', detail: e.message, retryable: true });
             setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);
             finish(sendError);
         }
@@ -202,42 +242,55 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
             resolve(result);
         };
 
+        const queryId = Math.floor(Math.random() * 65534);
+
         try {
             const buf = dnsPacket.encode({
                 type: 'query',
-                id: Math.floor(Math.random() * 65534),
+                id: queryId,
                 questions: [{ type: qType, name: domain }],
                 additionals: getAdditionals(options)
             });
 
             client.send(buf, 0, buf.length, 53, serverIp, (err) => {
                 if (err) {
-                    const sendError = { error: 'SEND_ERROR', detail: err.message, transport: 'udp' };
+                    const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
                     setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);
                     return finish(sendError);
                 }
             });
         } catch (e) {
-            const sendError = { error: 'SEND_ERROR', detail: e.message, transport: 'udp' };
+            const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: e.message, retryable: true });
             setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);
             return finish(sendError);
         }
 
         timer = setTimeout(() => {
-            const timeoutResult = { error: 'TIMEOUT', transport: 'udp' };
+            const timeoutResult = buildDnsError('TIMEOUT', { domain, serverIp, qType, transport: 'udp', retryable: true });
             setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
             return finish(timeoutResult);
         }, options.timeoutMs);
 
         client.on('error', (err) => {
-            const socketError = { error: 'SOCKET_ERROR', detail: err.message, transport: 'udp' };
+            const socketError = buildDnsError('SOCKET_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
             setCacheEntry(dnsResponseCache, cacheKey, socketError, DNS_CACHE_TTL.transient);
             return finish(socketError);
         });
 
-        client.on('message', (msg) => {
+        client.on('message', (msg, rinfo) => {
             try {
+                // 想定外の送信元からの応答 (スプーフィング等) は無視し、正規の応答を待ち続ける
+                if (rinfo && rinfo.address.toLowerCase() !== serverIp.toLowerCase()) {
+                    return;
+                }
+
                 const decoded = dnsPacket.decode(msg);
+
+                // 遅延した別クエリの応答や id 不一致の応答は無視する (FORMERR 判定より前に検証)
+                if (!isMatchingResponse(decoded, queryId, domain, qType)) {
+                    return;
+                }
+
                 if (decoded.rcode === 'FORMERR' && options.useEdns) {
                     if (timer) clearTimeout(timer);
                     try { client.close(); } catch (e) {}
@@ -281,12 +334,12 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
 
                 const hasNsRecord = [...answers, ...authorities].some(r => r.type === 'NS' && hasParentChildRelationship(domain, r.name));
                 if (hasNsRecord) {
-                    setCacheEntry(dnsResponseCache, cacheKey, decoded, DNS_CACHE_TTL.success);
+                    setCacheEntry(dnsResponseCache, cacheKey, decoded, computeSuccessTtlMs(decoded));
                 }
 
                 return finish({ ...decoded, transport: 'udp' });
             } catch (e) {
-                const decodeError = { error: 'DECODE_ERROR', detail: e.message, transport: 'udp' };
+                const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'udp', detail: e.message, retryable: false });
                 setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
                 return finish(decodeError);
             }

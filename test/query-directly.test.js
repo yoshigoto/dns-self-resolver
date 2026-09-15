@@ -79,7 +79,7 @@ function mockUdp(onQuery) {
         socket.close = () => {};
         socket.send = (buffer, offset, length, port, host, callback) => {
             callback?.(null);
-            onQuery(dnsPacket.decode(buffer), socket);
+            onQuery(dnsPacket.decode(buffer), socket, host);
         };
         return socket;
     };
@@ -479,4 +479,100 @@ test('resolveRecordFromServer queries specified server for A and AAAA', async ()
     assert.equal(queries.length, 2);
     assert.equal(queries[0].serverIp, '192.0.2.1');
     assert.equal(queries[1].serverIp, '192.0.2.1');
+});
+
+test('mismatched transaction ID response is ignored, later matching response is accepted', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        // 先に無関係な (id 不一致) 応答が届き、後から正しい応答が届くケースを模す
+        queueMicrotask(() => {
+            const stray = dnsPacket.encode({
+                type: 'response',
+                id: (query.id + 1) % 65535,
+                questions: query.questions,
+                answers: [{ name: query.questions[0].name, type: 'NS', data: 'stray.test' }]
+            });
+            socket.emit('message', stray, { address: '192.0.2.1', port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('id-mismatch.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('response with mismatched question is ignored', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            const wrongQuestion = dnsPacket.encode({
+                type: 'response',
+                id: query.id,
+                questions: [{ type: 'NS', name: 'other-domain.test' }],
+                answers: [{ name: 'other-domain.test', type: 'NS', data: 'wrong.test' }]
+            });
+            socket.emit('message', wrongQuestion, { address: '192.0.2.1', port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('question-mismatch.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP response from an unexpected source address is ignored', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            // なりすまし送信元からの応答は無視され、正規サーバーからの応答のみ受理される
+            socket.emit('message', createDnsResponse(query), { address: '203.0.113.99', port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('spoofed-source.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('TIMEOUT results are cached only briefly, not forever', async () => {
+    const restoreUdp = mockUdp(() => {
+        // 応答を返さずタイムアウトさせる
+    });
+
+    try {
+        const cache = new Map();
+        const result = await queryDirectlyUDP('timeout.test', '192.0.2.1', cache, 'NS', { useEdns: false, timeoutMs: 10 });
+        assert.equal(result.error, 'TIMEOUT');
+
+        const cacheKey = [...cache.keys()][0];
+        const entry = cache.get(cacheKey);
+        assert.ok(entry.expiresAt < Date.now() + 5000, 'timeout cache entry must not be cached for a long duration');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('structured errors include serverIp, name, qType and retryable', async () => {
+    const restoreUdp = mockUdp(() => {});
+
+    try {
+        const result = await queryDirectlyUDP('structured-error.test', '192.0.2.5', new Map(), 'A', { useEdns: false, timeoutMs: 10 });
+        assert.equal(result.error, 'TIMEOUT');
+        assert.equal(result.serverIp, '192.0.2.5');
+        assert.equal(result.name, 'structured-error.test');
+        assert.equal(result.qType, 'A');
+        assert.equal(result.transport, 'udp');
+        assert.equal(result.retryable, true);
+    } finally {
+        restoreUdp();
+    }
 });

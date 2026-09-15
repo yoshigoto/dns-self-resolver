@@ -24,12 +24,29 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 提供する機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信
+- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID・question・(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・`knownAddresses` や共有キャッシュ対応)
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
 - `getReferralAddressRecords`: 委任応答の追加セクションから、次の問い合わせ先選定に使う参照アドレス (out-of-bailiwick を含む) を抽出。`isInBailiwickGlue` による正式な glue 判定とは区別される
-- `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ
+- `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ。成功応答は応答内レコードの TTL と上限値(既定 30秒)の小さい方でキャッシュされ、タイムアウトは短時間 (既定 2秒) のみキャッシュされる (恒久的な障害固定を防ぐため `Infinity` にはしない)
+
+## エラー形式
+
+`queryDirectlyUDP` / `queryDirectlyTCP` はエラー時に次の形の構造化オブジェクトを返します。
+
+```js
+{
+  error: 'TIMEOUT', // 'TIMEOUT' | 'SOCKET_ERROR' | 'SEND_ERROR' | 'DECODE_ERROR' | 'TCP_FALLBACK_ERROR'
+  name: 'example.com',
+  serverIp: '192.0.2.1',
+  qType: 'A',
+  transport: 'udp',
+  retryable: true,
+  detail: '...' // 例外メッセージ等 (存在する場合)
+}
+```
+
 
 ## 使い方
 
