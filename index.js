@@ -349,6 +349,21 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
 
 // a.root-servers.net の固定 IP。ここだけは OS/フルサービスリゾルバに頼らずに自己解決を開始するための起点。
 export const ROOT_SERVER_BOOTSTRAP_IP = '198.41.0.4';
+export const ROOT_SERVER_IPS = [
+    ROOT_SERVER_BOOTSTRAP_IP,
+    '199.9.14.201',
+    '192.33.4.12',
+    '199.7.91.13',
+    '192.203.230.10',
+    '192.5.5.241',
+    '192.112.36.4',
+    '198.97.190.53',
+    '192.36.148.17',
+    '192.58.128.30',
+    '193.0.14.129',
+    '199.7.83.42',
+    '202.12.27.33'
+];
 export const NAMESERVER_IP_CACHE_TTL = 300000; // レコードに TTL が無い場合のフォールバック
 const nameserverIpCache = new Map(); // 正規化ホスト名 -> { ips, expiresAt }
 const inFlightServerResolutions = new Map(); // 同一ホスト名の並行解決合流用 (Singleflight)
@@ -422,8 +437,10 @@ export async function resolveRecordFromServer(
 export async function resolveRecordFromRoot(name, qType, dnsResponseCache, dependencies = {}) {
     const queryUDP = dependencies.queryDirectlyUDP || queryDirectlyUDP;
     const resolveIPv4 = dependencies.resolveHostnameIPv4Self || resolveHostnameIPv4Self;
+    let queryName = normalizeDnsName(name);
     let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
-    let candidateQueue = [];
+    let candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip }));
+    const visitedNames = new Set([queryName]);
 
     const useNextCandidate = async () => {
         while (candidateQueue.length > 0) {
@@ -438,16 +455,28 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     };
 
     for (let depth = 0; depth < 10; depth++) {
-        const res = await queryUDP(name, currentServerIp, dnsResponseCache, qType);
+        const res = await queryUDP(queryName, currentServerIp, dnsResponseCache, qType);
         if (res.error) {
             if (await useNextCandidate()) continue;
             return [];
         }
 
         const matchedAnswers = (res.answers || [])
-            .filter(record => record.type === qType && normalizeDnsName(record.name) === normalizeDnsName(name));
+            .filter(record => record.type === qType && normalizeDnsName(record.name) === queryName);
         if (matchedAnswers.length > 0) {
             return matchedAnswers.map(record => record.data);
+        }
+
+        const cname = (res.answers || []).find(record =>
+            record.type === 'CNAME' && normalizeDnsName(record.name) === queryName);
+        if (cname) {
+            const cnameTarget = normalizeDnsName(cname.data);
+            if (!cnameTarget || visitedNames.has(cnameTarget)) return [];
+            visitedNames.add(cnameTarget);
+            queryName = cnameTarget;
+            currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
+            candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip }));
+            continue;
         }
 
         const AUTHORITATIVE_ANSWER = dnsPacket.AUTHORITATIVE_ANSWER || 1024;
@@ -502,6 +531,54 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     }
 
     return [];
+}
+
+export async function resolveDnsServerAddressByType(
+    dnsServer,
+    preferIpv6 = false,
+    resolutionDepth = 0,
+    dependencies = {}
+) {
+    const normalized = normalizeDnsName(dnsServer);
+    if (net.isIP(normalized)) {
+        return normalized;
+    }
+    if (resolutionDepth >= 5) {
+        throw new Error('DNSサーバー名の解決で入れ子の委任が上限を超えました。');
+    }
+
+    const family = preferIpv6 ? 'AAAA' : 'A';
+    const known = getKnownAddress(dependencies.knownAddresses, normalized, family);
+    if (known && known.length > 0) return known[0];
+
+    const cache = dependencies.dnsResponseCache || dependencies.cache || new Map();
+    const resolver = dependencies.resolveRecordFromRoot || resolveRecordFromRoot;
+    const addresses = await resolver(normalized, family, cache, {
+        ...dependencies,
+        resolvingStack: new Set(dependencies.resolvingStack || []).add(normalized)
+    });
+    const address = (addresses || []).find(candidate =>
+        net.isIP(candidate) === (preferIpv6 ? 6 : 4));
+    if (address) return address;
+    throw new Error(`DNSサーバー名 ${dnsServer} の ${family} レコードが見つかりませんでした。`);
+}
+
+export async function resolveDnsServerAddress(
+    dnsServer,
+    preferIpv6 = false,
+    resolutionDepth = 0,
+    dependencies = {}
+) {
+    try {
+        return await resolveDnsServerAddressByType(dnsServer, preferIpv6, resolutionDepth, dependencies);
+    } catch (error) {
+        if (preferIpv6) throw error;
+        try {
+            return await resolveDnsServerAddressByType(dnsServer, true, resolutionDepth, dependencies);
+        } catch {
+            throw error;
+        }
+    }
 }
 
 // NS 名の IP アドレス解決専用の入り口。グルー不足時の再帰呼び出しで循環参照を検出する。

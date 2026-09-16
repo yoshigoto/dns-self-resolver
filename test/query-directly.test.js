@@ -17,6 +17,8 @@ import {
     resolveServerIPs,
     resolveHostnameIPv4Self,
     resolveRecordFromServer,
+    resolveDnsServerAddressByType,
+    resolveDnsServerAddress,
     ROOT_SERVER_BOOTSTRAP_IP
 } from '../index.js';
 
@@ -479,6 +481,51 @@ test('resolveRecordFromServer queries specified server for A and AAAA', async ()
     assert.equal(queries.length, 2);
     assert.equal(queries[0].serverIp, '192.0.2.1');
     assert.equal(queries[1].serverIp, '192.0.2.1');
+});
+
+test('resolveRecordFromRoot follows CNAME before returning the requested type', async () => {
+    const queries = [];
+    const result = await resolveRecordFromRoot('alias.example.test', 'A', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp, cache, qType) => {
+            queries.push({ domain, serverIp, qType });
+            if (domain === 'alias.example.test') {
+                return { answers: [{ name: domain, type: 'CNAME', data: 'target.example.test' }] };
+            }
+            return { answers: [{ name: domain, type: 'A', data: '192.0.2.45' }] };
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.45']);
+    assert.deepEqual(queries.map(query => query.domain), ['alias.example.test', 'target.example.test']);
+});
+
+test('resolveDnsServerAddressByType resolves the requested address family', async () => {
+    const calls = [];
+    const dependencies = {
+        resolveRecordFromRoot: async (name, qType) => {
+            calls.push({ name, qType });
+            return qType === 'AAAA' ? ['2001:db8::53'] : [];
+        }
+    };
+
+    assert.equal(
+        await resolveDnsServerAddressByType('ns.example.test', true, 0, dependencies),
+        '2001:db8::53'
+    );
+    assert.deepEqual(calls, [{ name: 'ns.example.test', qType: 'AAAA' }]);
+});
+
+test('resolveDnsServerAddress falls back from A to AAAA', async () => {
+    const queriedTypes = [];
+    const address = await resolveDnsServerAddress('ns.example.test', false, 0, {
+        resolveRecordFromRoot: async (name, qType) => {
+            queriedTypes.push(qType);
+            return qType === 'AAAA' ? ['2001:db8::54'] : [];
+        }
+    });
+
+    assert.equal(address, '2001:db8::54');
+    assert.deepEqual(queriedTypes, ['A', 'AAAA']);
 });
 
 test('mismatched transaction ID response is ignored, later matching response is accepted', async () => {
