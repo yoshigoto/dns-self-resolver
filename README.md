@@ -28,9 +28,9 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい
-- `resolveRecordFromRoot` の `dependencies.gluePolicy`: 既定の `strict` は in-domain glue のみを利用。RFC 9471 §2.3 の循環 sibling 委任を扱う場合は `allow-sibling` を明示すると、問い合わせ中のサーバーゾーン配下にある sibling glue も利用する
+- `resolveRecordFromRoot` の `dependencies.gluePolicy`: 既定の `strict` は委任先ゾーン内の glue と root referral が返す TLD NS glue を利用。RFC 9471 §2.3 の循環 sibling 委任を扱う場合は `allow-sibling` を明示すると、問い合わせ中のサーバーゾーン配下にある sibling glue も利用する
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
-- `getReferralAddressRecords`: 委任応答の追加セクションからglueを抽出。`strict` は委任 owner name 配下のみ、`allow-sibling` は問い合わせ元ゾーン配下までを許可する。問い合わせ元ゾーンが省略された場合は委任ゾーン内に限定する
+- `getReferralAddressRecords`: 委任応答の追加セクションからglueを抽出。`strict` は委任 owner name 配下を許可し、root referral では `serverZone: '.'` を渡すと root が返す NS glue も許可する。`allow-sibling` は問い合わせ元ゾーン配下までを許可する。問い合わせ元ゾーンが省略された場合は委任ゾーン内に限定する
 - `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ。成功応答は応答内レコードの TTL と上限値(既定 30秒)の小さい方でキャッシュされ、タイムアウトは短時間 (既定 2秒) のみキャッシュされる (恒久的な障害固定を防ぐため `Infinity` にはしない)
 
 ## エラー形式

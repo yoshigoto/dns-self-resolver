@@ -10,6 +10,7 @@ import {
     isInBailiwickGlue,
     isIPv6,
     isSubdomainOrEqual,
+    getReferralAddressRecords,
     normalizeDnsName,
     queryDirectlyTCP,
     queryDirectlyUDP,
@@ -178,6 +179,25 @@ test('in-domain glue だけを採用する', () => {
             'child.example.com'
         ),
         false
+    );
+});
+
+test('root referral では委任先ゾーン外でも NS に対応する glue を採用する', () => {
+    const additionals = [
+        { type: 'A', name: 'a.gtld-servers.net', data: '192.0.2.53' },
+        { type: 'A', name: 'unlisted.example.net', data: '192.0.2.54' },
+        { type: 'TXT', name: 'a.gtld-servers.net', data: 'not glue' }
+    ];
+
+    assert.deepEqual(
+        getReferralAddressRecords(
+            additionals,
+            ['a.gtld-servers.net'],
+            'com',
+            'strict',
+            '.'
+        ),
+        [additionals[0]]
     );
 });
 
@@ -483,10 +503,9 @@ test('a candidate without any referral address falls back to recursive self-reso
     assert.deepEqual(resolvedHosts, ['ns2.external.test']);
 });
 
-test('out-of-bailiwick referral address is ignored and recursively resolved', async () => {
+test('strict ignores out-of-bailiwick glue from a non-root referral', async () => {
     const calls = [];
     const resolvedHosts = [];
-    // a.gtld-servers.net は委任 owner (com) の out-of-bailiwick なので glue を無視する。
     const result = await resolveRecordFromRoot('example.com', 'NS', new Map(), {
         queryDirectlyUDP: async (domain, serverIp) => {
             calls.push(serverIp);
@@ -500,6 +519,16 @@ test('out-of-bailiwick referral address is ignored and recursively resolved', as
                     ]
                 };
             }
+            if (serverIp === '192.5.6.30') {
+                return {
+                    authorities: [
+                        { name: 'example.com', type: 'NS', data: 'ns1.external.net' }
+                    ],
+                    additionals: [
+                        { name: 'ns1.external.net', type: 'A', data: '192.5.6.31' }
+                    ]
+                };
+            }
             assert.equal(serverIp, '192.5.6.31');
             return {
                 answers: [{ name: domain, type: 'NS', data: 'ns1.example.com' }]
@@ -507,14 +536,14 @@ test('out-of-bailiwick referral address is ignored and recursively resolved', as
         },
         resolveHostnameIPv4Self: async hostname => {
             resolvedHosts.push(hostname);
-            assert.equal(hostname, 'a.gtld-servers.net');
+            assert.equal(hostname, 'ns1.external.net');
             return '192.5.6.31';
         }
     });
 
     assert.deepEqual(result, ['ns1.example.com']);
-    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.31']);
-    assert.deepEqual(resolvedHosts, ['a.gtld-servers.net']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.30', '192.5.6.31']);
+    assert.deepEqual(resolvedHosts, ['ns1.external.net']);
 });
 
 test('allow-sibling policy uses out-of-bailiwick referral address', async () => {
@@ -761,12 +790,7 @@ for (const [label, resolveSelf, qType, answer] of [
             gluePolicy,
             queryDirectlyUDP: async (domain, serverIp, cache, type) => {
                 calls.push({ gluePolicy, serverIp });
-                if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
-                    return {
-                        authorities: [{ name: 'com', type: 'NS', data: hostname }],
-                        additionals: [{ name: hostname, type: 'A', data: '192.0.2.9' }]
-                    };
-                }
+                assert.equal(serverIp, ROOT_SERVER_BOOTSTRAP_IP);
                 return { flags: 1024, answers: [{ name: domain, type, data: answer }] };
             }
         });
@@ -774,9 +798,9 @@ for (const [label, resolveSelf, qType, answer] of [
         assert.equal(await resolveSelf(hostname, makeDeps('allow-sibling')), answer);
         const callsAfterSibling = calls.length;
 
-        assert.equal(await resolveSelf(hostname, makeDeps('strict')), null);
+        assert.equal(await resolveSelf(hostname, makeDeps('strict')), answer);
         assert.ok(calls.length > callsAfterSibling, 'strict must query instead of reusing the allow-sibling cache');
-        assert.ok(calls.slice(callsAfterSibling).every(call => call.serverIp !== '192.0.2.9'));
+        assert.ok(calls.slice(callsAfterSibling).every(call => call.serverIp === ROOT_SERVER_BOOTSTRAP_IP));
     });
 }
 

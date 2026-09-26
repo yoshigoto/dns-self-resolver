@@ -33,8 +33,8 @@ export function isInBailiwickGlue(record, nsNames, delegatedZone) {
         isSubdomainOrEqual(record.name, delegatedZone);
 }
 
-// 委任 owner name より下にある NS ターゲットの glue だけを、次の問い合わせ先に使う。
-// out-of-bailiwick な追加レコードは authoritative な A/AAAA 解決を迂回するため利用しない。
+// 委任 owner 配下の glue を使い、root referral では root が返す TLD NS glue も許可する。
+// それ以外の out-of-bailiwick な追加レコードは authoritative な A/AAAA 解決を迂回するため利用しない。
 export function getReferralAddressRecords(
     additionals,
     nsNames,
@@ -43,8 +43,12 @@ export function getReferralAddressRecords(
     serverZone = delegatedZone
 ) {
     if (gluePolicy === 'strict') {
+        const isRootReferral = serverZone === '.';
         return additionals.filter(record =>
-            isInBailiwickGlue(record, nsNames, delegatedZone));
+            isInBailiwickGlue(record, nsNames, delegatedZone) ||
+            (isRootReferral &&
+                (record.type === 'A' || record.type === 'AAAA') &&
+                nsNames.includes(normalizeDnsName(record.name))));
     }
     if (gluePolicy !== 'allow-sibling') {
         throw new Error(`未対応の gluePolicy です: ${gluePolicy}`);
