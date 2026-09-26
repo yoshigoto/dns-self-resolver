@@ -300,6 +300,114 @@ test('TCP query finishes after receiving a complete message without waiting for 
     }
 });
 
+test('resolveRecordFromRoot forwards query options and signal to each DNS query', async () => {
+    const controller = new AbortController();
+    const receivedOptions = [];
+
+    const result = await resolveRecordFromRoot('options.example.test', 'A', new Map(), {
+        queryOptions: { timeoutMs: 250, useEdns: false },
+        signal: controller.signal,
+        queryDirectlyUDP: async (domain, serverIp, cache, qType, options) => {
+            receivedOptions.push(options);
+            return {
+                flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                answers: [{ name: domain, type: qType, data: '192.0.2.25' }]
+            };
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.25']);
+    assert.equal(receivedOptions.length, 1);
+    assert.equal(receivedOptions[0].timeoutMs, 250);
+    assert.equal(receivedOptions[0].useEdns, false);
+    assert.equal(receivedOptions[0].signal, controller.signal);
+});
+
+test('queryDirectlyUDP closes its socket when aborted', async () => {
+    const originalCreateSocket = dgram.createSocket;
+    const controller = new AbortController();
+    let closed = false;
+
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => { closed = true; };
+        socket.send = (buffer, offset, length, port, host, callback) => callback?.(null);
+        return socket;
+    };
+
+    try {
+        const pending = queryDirectlyUDP('abort.test', '192.0.2.1', new Map(), 'A', {
+            timeoutMs: 1000,
+            signal: controller.signal
+        });
+        controller.abort();
+        const result = await pending;
+
+        assert.equal(result.error, 'ABORTED');
+        assert.equal(closed, true);
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
+});
+
+test('queryDirectlyTCP destroys its socket when aborted', async () => {
+    const originalCreateConnection = net.createConnection;
+    const controller = new AbortController();
+    let destroyed = false;
+
+    net.createConnection = () => {
+        const socket = new EventEmitter();
+        socket.destroy = () => { destroyed = true; };
+        socket.write = () => {};
+        return socket;
+    };
+
+    try {
+        const pending = queryDirectlyTCP('abort.test', '192.0.2.1', new Map(), 'A', {
+            timeoutMs: 1000,
+            signal: controller.signal
+        });
+        controller.abort();
+        const result = await pending;
+
+        assert.equal(result.error, 'ABORTED');
+        assert.equal(destroyed, true);
+    } finally {
+        net.createConnection = originalCreateConnection;
+    }
+});
+
+test('resolveRecordFromRoot does not retry another server after cancellation', async () => {
+    const controller = new AbortController();
+    let queryCount = 0;
+
+    const result = await resolveRecordFromRoot('abort.example.test', 'A', new Map(), {
+        signal: controller.signal,
+        queryDirectlyUDP: async () => {
+            queryCount++;
+            controller.abort();
+            return { error: 'ABORTED' };
+        }
+    });
+
+    assert.deepEqual(result, []);
+    assert.equal(queryCount, 1);
+});
+
+test('timeout cache entries are separated by timeoutMs', async () => {
+    const restoreUdp = mockUdp(() => {});
+
+    try {
+        const cache = new Map();
+        await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', { timeoutMs: 1 });
+        await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', { timeoutMs: 2 });
+
+        assert.equal(cache.size, 2);
+    } finally {
+        restoreUdp();
+    }
+});
+
 test('a candidate without any referral address falls back to recursive self-resolution', async () => {
     const calls = [];
     const resolvedHosts = [];

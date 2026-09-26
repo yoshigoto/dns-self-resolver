@@ -85,6 +85,17 @@ function buildDnsError(code, { domain, serverIp, qType, transport, detail, retry
     };
 }
 
+function buildAbortError({ domain, serverIp, qType, transport, signal }) {
+    return buildDnsError('ABORTED', {
+        domain,
+        serverIp,
+        qType,
+        transport,
+        detail: signal?.reason?.message,
+        retryable: false
+    });
+}
+
 export function getCacheEntry(dnsResponseCache, cacheKey) {
     const entry = dnsResponseCache.get(cacheKey);
     if (!entry) {
@@ -114,7 +125,7 @@ function normalizeQueryOptions(options, defaults = {}) {
 }
 
 function getDnsCacheKey(serverIp, qType, domain, options) {
-    return `${serverIp}|${qType}|${domain}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}`;
+    return `${serverIp}|${qType}|${domain}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}|timeout:${options.timeoutMs}`;
 }
 
 function getAdditionals(options) {
@@ -145,6 +156,10 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
     });
 
     return new Promise((resolve) => {
+        if (options.signal?.aborted) {
+            return resolve(buildAbortError({ domain, serverIp, qType, transport: 'tcp', signal: options.signal }));
+        }
+
         const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
         const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
         // 以前に同じサーバー・タイプ・ドメインに対して問い合わせ済みなら、即時復元
@@ -155,14 +170,27 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
         let settled = false;
         let socket = null;
         let timer = null;
+        let abortHandler = null;
 
         const finish = (result) => {
             if (settled) return;
             settled = true;
             if (timer) clearTimeout(timer);
+            if (abortHandler) options.signal.removeEventListener('abort', abortHandler);
             if (socket) socket.destroy();
             resolve(result);
         };
+
+        if (options.signal) {
+            abortHandler = () => finish(buildAbortError({
+                domain,
+                serverIp,
+                qType,
+                transport: 'tcp',
+                signal: options.signal
+            }));
+            options.signal.addEventListener('abort', abortHandler, { once: true });
+        }
 
         const queryId = Math.floor(Math.random() * 65534);
 
@@ -175,7 +203,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
             });
 
             socket = net.createConnection({ host: serverIp, port: 53 }, () => {
-                socket.write(tcpBuf);
+                if (!settled) socket.write(tcpBuf);
             });
 
             timer = setTimeout(() => {
@@ -237,6 +265,10 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
     });
 
     return new Promise((resolve) => {
+        if (options.signal?.aborted) {
+            return resolve(buildAbortError({ domain, serverIp, qType, transport: 'udp', signal: options.signal }));
+        }
+
         const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
         const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
         // 以前に同じサーバー・タイプ・ドメインに対して問い合わせ済みなら、即時復元
@@ -248,14 +280,27 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
         const client = dgram.createSocket(socketType);
         let settled = false;
         let timer = null;
+        let abortHandler = null;
 
         const finish = (result) => {
             if (settled) return;
             settled = true;
             if (timer) clearTimeout(timer);
+            if (abortHandler) options.signal.removeEventListener('abort', abortHandler);
             try { client.close(); } catch (e) {}
             resolve(result);
         };
+
+        if (options.signal) {
+            abortHandler = () => finish(buildAbortError({
+                domain,
+                serverIp,
+                qType,
+                transport: 'udp',
+                signal: options.signal
+            }));
+            options.signal.addEventListener('abort', abortHandler, { once: true });
+        }
 
         const queryId = Math.floor(Math.random() * 65534);
 
@@ -467,6 +512,10 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     const resolveIPv4 = dependencies.resolveHostnameIPv4Self || resolveHostnameIPv4Self;
     const resolveIPv6 = dependencies.resolveHostnameIPv6Self || resolveHostnameIPv6Self;
     const gluePolicy = dependencies.gluePolicy || 'strict';
+    const queryOptions = {
+        ...(dependencies.queryOptions || {}),
+        ...(dependencies.signal ? { signal: dependencies.signal } : {})
+    };
     let queryName = normalizeDnsName(name);
     let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
     let currentServerZone = '.';
@@ -488,7 +537,10 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     };
 
     for (let depth = 0; depth < 10; depth++) {
-        const res = await queryUDP(queryName, currentServerIp, dnsResponseCache, qType);
+        if (queryOptions.signal?.aborted) return [];
+
+        const res = await queryUDP(queryName, currentServerIp, dnsResponseCache, qType, queryOptions);
+        if (res.error === 'ABORTED') return [];
         if (res.error) {
             if (await useNextCandidate()) continue;
             return [];

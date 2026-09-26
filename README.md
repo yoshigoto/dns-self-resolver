@@ -24,7 +24,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 提供する機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID・question・(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける
+- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID・question・(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける。`timeoutMs` と `AbortSignal` を指定可能
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい
@@ -39,7 +39,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ```js
 {
-  error: 'TIMEOUT', // 'TIMEOUT' | 'SOCKET_ERROR' | 'SEND_ERROR' | 'DECODE_ERROR' | 'TCP_FALLBACK_ERROR'
+  error: 'TIMEOUT', // 'TIMEOUT' | 'ABORTED' | 'SOCKET_ERROR' | 'SEND_ERROR' | 'DECODE_ERROR' | 'TCP_FALLBACK_ERROR'
   name: 'example.com',
   serverIp: '192.0.2.1',
   qType: 'A',
@@ -62,11 +62,25 @@ const dnssecRes = await queryDirectlyUDP('com', '198.41.0.4', cache, 'DS', {
 	useEdns: true,
 	dnssecOk: true,
 	udpPayloadSize: 1232,
-	timeoutMs: 5000
+  timeoutMs: 5000,
+  signal: AbortSignal.timeout(30000)
 });
 ```
 
 `queryDirectlyTCP` の第5引数にも同じオプションオブジェクトを指定できます。`queryDirectlyUDP` の従来の第5引数 (`useEdns` の boolean) も引き続き利用できます。UDP応答の `TC` フラグによるTCPフォールバックではオプションが維持され、キャッシュはEDNSとDNSSEC OK (DO) の有無ごとに分離されます。
+
+ルートからの探索では、問い合わせ1回ごとの制限を `queryOptions.timeoutMs`、探索全体の制限を `signal` で指定します。`signal` が中断されると進行中のUDP/TCPソケットを閉じ、後続サーバーへの再試行も停止します。
+
+```js
+import { resolveRecordFromRoot } from 'dns-self-resolver';
+
+const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
+  queryOptions: { timeoutMs: 2000 },
+  signal: AbortSignal.timeout(30000)
+});
+```
+
+タイムアウト結果を含むキャッシュは `timeoutMs` ごとに分離されます。全体制限に `Promise.race` だけを使うと裏側の問い合わせは継続するため、停止が必要な場合は `AbortSignal` を利用してください。
 
 依存性注入 (`dependencies` 引数) でクエリ関数を差し替えられるため、ユニットテストではモックを渡してネットワークアクセスなしに検証できます。
 
