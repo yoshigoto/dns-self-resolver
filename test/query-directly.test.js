@@ -574,6 +574,36 @@ test('nameserver resolution cache is separated by glue policy', async () => {
     assert.equal(queryCount, 8);
 });
 
+for (const [label, resolveSelf, qType, answer] of [
+    ['IPv4', resolveHostnameIPv4Self, 'A', '192.0.2.10'],
+    ['IPv6', resolveHostnameIPv6Self, 'AAAA', '2001:db8::10']
+]) {
+    test(`resolveHostname${label}Self does not reuse allow-sibling results for strict policy`, async () => {
+        const hostname = `ns-${label.toLowerCase()}.external.test`;
+        const calls = [];
+        const makeDeps = gluePolicy => ({
+            gluePolicy,
+            queryDirectlyUDP: async (domain, serverIp, cache, type) => {
+                calls.push({ gluePolicy, serverIp });
+                if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                    return {
+                        authorities: [{ name: 'com', type: 'NS', data: hostname }],
+                        additionals: [{ name: hostname, type: 'A', data: '192.0.2.9' }]
+                    };
+                }
+                return { flags: 1024, answers: [{ name: domain, type, data: answer }] };
+            }
+        });
+
+        assert.equal(await resolveSelf(hostname, makeDeps('allow-sibling')), answer);
+        const callsAfterSibling = calls.length;
+
+        assert.equal(await resolveSelf(hostname, makeDeps('strict')), null);
+        assert.ok(calls.length > callsAfterSibling, 'strict must query instead of reusing the allow-sibling cache');
+        assert.ok(calls.slice(callsAfterSibling).every(call => call.serverIp !== '192.0.2.9'));
+    });
+}
+
 test('cycle in NS self-resolution properly returns null', async () => {
     // ns1.cyclic.test delegates to ns1.cyclic.test with no glue
     const mockQueryUDP = async (domain, serverIp, cache, qType) => {
