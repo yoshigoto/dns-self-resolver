@@ -33,12 +33,11 @@ export function isInBailiwickGlue(record, nsNames, delegatedZone) {
         isSubdomainOrEqual(record.name, delegatedZone);
 }
 
-// RFC 9471 上の glue 判定 (isInBailiwickGlue) とは別に、次の問い合わせ先を選ぶための探索用アドレスを集める。
-// a.gtld-servers.net のような out-of-bailiwick な追加レコードも、探索の効率化には利用してよい。
-export function getReferralAddressRecords(additionals, nsNames) {
+// 委任 owner name より下にある NS ターゲットの glue だけを、次の問い合わせ先に使う。
+// out-of-bailiwick な追加レコードは authoritative な A/AAAA 解決を迂回するため利用しない。
+export function getReferralAddressRecords(additionals, nsNames, delegatedZone) {
     return additionals.filter(record =>
-        (record.type === 'A' || record.type === 'AAAA') &&
-        nsNames.includes(normalizeDnsName(record.name)));
+    isInBailiwickGlue(record, nsNames, delegatedZone));
 }
 
 export const DNS_CACHE_TTL = {
@@ -492,10 +491,8 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
         }
 
         const nsNames = nsRecords.map(r => normalizeDnsName(r.data));
-        // 次の問い合わせ先の選定には、正式な glue (isInBailiwickGlue) に限らず、
-        // a.gtld-servers.net のような out-of-bailiwick な参照アドレスも探索用に利用する。
         const referralAddressByNsName = new Map();
-        getReferralAddressRecords(res.additionals || [], nsNames)
+        getReferralAddressRecords(res.additionals || [], nsNames, nsRecords[0].name)
             .forEach(record => {
                 const key = normalizeDnsName(record.name);
                 if (!referralAddressByNsName.has(key)) referralAddressByNsName.set(key, record.data);

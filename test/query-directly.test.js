@@ -333,11 +333,10 @@ test('a candidate without any referral address falls back to recursive self-reso
     assert.deepEqual(resolvedHosts, ['ns2.external.test']);
 });
 
-test('out-of-bailiwick referral address (root -> com) is used without recursive self-resolution', async () => {
+test('out-of-bailiwick referral address is ignored and recursively resolved', async () => {
     const calls = [];
     const resolvedHosts = [];
-    // a.gtld-servers.net はルートから見て out-of-bailiwick (com. 配下ではない) だが、
-    // 探索用の参照アドレスとして additionals に含まれる。
+    // a.gtld-servers.net は委任 owner (com) の out-of-bailiwick なので glue を無視する。
     const result = await resolveRecordFromRoot('example.com', 'NS', new Map(), {
         queryDirectlyUDP: async (domain, serverIp) => {
             calls.push(serverIp);
@@ -351,21 +350,21 @@ test('out-of-bailiwick referral address (root -> com) is used without recursive 
                     ]
                 };
             }
-            assert.equal(serverIp, '192.5.6.30');
+            assert.equal(serverIp, '192.5.6.31');
             return {
                 answers: [{ name: domain, type: 'NS', data: 'ns1.example.com' }]
             };
         },
         resolveHostnameIPv4Self: async hostname => {
             resolvedHosts.push(hostname);
-            return null;
+            assert.equal(hostname, 'a.gtld-servers.net');
+            return '192.5.6.31';
         }
     });
 
     assert.deepEqual(result, ['ns1.example.com']);
-    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.30']);
-    // 参照アドレスがそのまま使われ、循環しうる自己解決へは進まない。
-    assert.deepEqual(resolvedHosts, []);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.31']);
+    assert.deepEqual(resolvedHosts, ['a.gtld-servers.net']);
 });
 
 test('resolveServerIPs returns knownAddresses without root resolution', async () => {
