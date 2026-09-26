@@ -91,6 +91,47 @@ function mockUdp(onQuery) {
     };
 }
 
+function createAbortAwareQuery() {
+    let queryCount = 0;
+    return {
+        queryDirectlyUDP: async (domain, serverIp, cache, qType, options = {}) => {
+            queryCount++;
+            if (options.signal) {
+                return new Promise(resolve => {
+                    const abort = () => resolve({ error: 'ABORTED' });
+                    if (options.signal.aborted) return abort();
+                    options.signal.addEventListener('abort', abort, { once: true });
+                });
+            }
+            return {
+                flags: 1024,
+                answers: [{
+                    name: domain,
+                    type: qType,
+                    data: qType === 'A' ? '192.0.2.57' : '2001:db8::57'
+                }]
+            };
+        },
+        getQueryCount: () => queryCount
+    };
+}
+
+async function assertCancellationIsolated(hostname, resolver, expectedResult, expectedQueryCount) {
+    const controller = new AbortController();
+    const query = createAbortAwareQuery();
+    const cancelled = resolver(hostname, {
+        signal: controller.signal,
+        queryDirectlyUDP: query.queryDirectlyUDP
+    });
+    const independent = resolver(hostname, { queryDirectlyUDP: query.queryDirectlyUDP });
+
+    controller.abort();
+
+    assert.equal(await cancelled, null);
+    assert.deepEqual(await independent, expectedResult);
+    assert.equal(query.getQueryCount(), expectedQueryCount);
+}
+
 test('DNS 名を小文字化し、末尾ドットを除去する', () => {
     assert.equal(normalizeDnsName(' NS1.Example.COM. '), 'ns1.example.com');
     assert.equal(normalizeDnsName(null), '');
@@ -656,6 +697,33 @@ test('concurrent resolution of the same NS name shares promise without returning
     assert.deepEqual(res3, ['192.0.2.55', '2001:db8::55']);
     // All 3 callers shared the singleflight resolution
     assert.equal(queryCount, 2); // 1 for A and 1 for AAAA
+});
+
+test('IPv4 cancellation does not affect a concurrent resolution without a signal', async () => {
+    await assertCancellationIsolated(
+        'cancel-isolated-ipv4.example.test',
+        resolveHostnameIPv4Self,
+        '192.0.2.57',
+        2
+    );
+});
+
+test('IPv6 cancellation does not affect a concurrent resolution without a signal', async () => {
+    await assertCancellationIsolated(
+        'cancel-isolated-ipv6.example.test',
+        resolveHostnameIPv6Self,
+        '2001:db8::57',
+        2
+    );
+});
+
+test('server IP cancellation does not affect a concurrent resolution without a signal', async () => {
+    await assertCancellationIsolated(
+        'cancel-isolated-server.example.test',
+        resolveServerIPs,
+        ['192.0.2.57', '2001:db8::57'],
+        4
+    );
 });
 
 test('nameserver resolution cache is separated by glue policy', async () => {

@@ -700,7 +700,8 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     }
 
     const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
-    if (inFlightIpv4Resolutions.has(resolutionKey)) {
+    const shareInFlight = !dependencies.signal;
+    if (shareInFlight && inFlightIpv4Resolutions.has(resolutionKey)) {
         return inFlightIpv4Resolutions.get(resolutionKey);
     }
 
@@ -717,11 +718,11 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
         return null;
     })();
 
-    inFlightIpv4Resolutions.set(resolutionKey, promise);
+    if (shareInFlight) inFlightIpv4Resolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightIpv4Resolutions.delete(resolutionKey);
+        if (shareInFlight) inFlightIpv4Resolutions.delete(resolutionKey);
     }
 }
 
@@ -746,7 +747,8 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     if (resolvingStack.has(normalized)) return null;
 
     const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
-    if (inFlightIpv6Resolutions.has(resolutionKey)) {
+    const shareInFlight = !dependencies.signal;
+    if (shareInFlight && inFlightIpv6Resolutions.has(resolutionKey)) {
         return inFlightIpv6Resolutions.get(resolutionKey);
     }
 
@@ -763,11 +765,11 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
         return null;
     })();
 
-    inFlightIpv6Resolutions.set(resolutionKey, promise);
+    if (shareInFlight) inFlightIpv6Resolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightIpv6Resolutions.delete(resolutionKey);
+        if (shareInFlight) inFlightIpv6Resolutions.delete(resolutionKey);
     }
 }
 
@@ -789,7 +791,8 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
     }
 
     const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
-    if (inFlightServerResolutions.has(resolutionKey)) {
+    const shareInFlight = !dependencies.signal;
+    if (shareInFlight && inFlightServerResolutions.has(resolutionKey)) {
         return inFlightServerResolutions.get(resolutionKey);
     }
 
@@ -808,10 +811,10 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
         return ips;
     })();
 
-    inFlightServerResolutions.set(resolutionKey, promise);
+    if (shareInFlight) inFlightServerResolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightServerResolutions.delete(resolutionKey);
+        if (shareInFlight) inFlightServerResolutions.delete(resolutionKey);
     }
 }
