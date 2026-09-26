@@ -550,6 +550,30 @@ test('concurrent resolution of the same NS name shares promise without returning
     assert.equal(queryCount, 2); // 1 for A and 1 for AAAA
 });
 
+test('nameserver resolution cache is separated by glue policy', async () => {
+    let queryCount = 0;
+    const queryDirectlyUDP = async (domain, serverIp, cache, qType) => {
+        queryCount++;
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return {
+            flags: 1024,
+            answers: [{ name: domain, type: qType, data: qType === 'A' ? '192.0.2.56' : '2001:db8::56' }]
+        };
+    };
+    const concurrentHostname = 'policy-isolated-concurrent-ns.example.test';
+
+    await Promise.all([
+        resolveServerIPs(concurrentHostname, { gluePolicy: 'allow-sibling', queryDirectlyUDP }),
+        resolveServerIPs(concurrentHostname, { gluePolicy: 'strict', queryDirectlyUDP })
+    ]);
+    assert.equal(queryCount, 4);
+
+    const cachedHostname = 'policy-isolated-cached-ns.example.test';
+    await resolveServerIPs(cachedHostname, { gluePolicy: 'allow-sibling', queryDirectlyUDP });
+    await resolveServerIPs(cachedHostname, { gluePolicy: 'strict', queryDirectlyUDP });
+    assert.equal(queryCount, 8);
+});
+
 test('cycle in NS self-resolution properly returns null', async () => {
     // ns1.cyclic.test delegates to ns1.cyclic.test with no glue
     const mockQueryUDP = async (domain, serverIp, cache, qType) => {

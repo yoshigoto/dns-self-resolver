@@ -380,13 +380,17 @@ export const ROOT_SERVER_IPS = [
     '202.12.27.33'
 ];
 export const NAMESERVER_IP_CACHE_TTL = 300000; // レコードに TTL が無い場合のフォールバック
-const nameserverIpCache = new Map(); // 正規化ホスト名 -> { ips, expiresAt }
-const inFlightServerResolutions = new Map(); // 同一ホスト名の並行解決合流用 (Singleflight)
-const inFlightIpv4Resolutions = new Map();   // 同一ホスト名の並行解決合流用 (Singleflight)
-const inFlightIpv6Resolutions = new Map();   // 同一ホスト名の並行解決合流用 (Singleflight)
+const nameserverIpCache = new Map(); // 正規化ホスト名と gluePolicy -> { ips, expiresAt }
+const inFlightServerResolutions = new Map(); // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
+const inFlightIpv4Resolutions = new Map();   // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
+const inFlightIpv6Resolutions = new Map();   // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
 
-export function getCachedNameserverIPs(hostname) {
-    const key = normalizeDnsName(hostname);
+function getNameserverResolutionKey(hostname, gluePolicy = 'strict') {
+    return `${normalizeDnsName(hostname)}|glue:${gluePolicy}`;
+}
+
+export function getCachedNameserverIPs(hostname, gluePolicy = 'strict') {
+    const key = getNameserverResolutionKey(hostname, gluePolicy);
     const cached = nameserverIpCache.get(key);
     if (!cached) return null;
     if (cached.expiresAt <= Date.now()) {
@@ -396,9 +400,17 @@ export function getCachedNameserverIPs(hostname) {
     return cached.ips;
 }
 
-export function cacheNameserverIPs(hostname, ips, ttlMs = NAMESERVER_IP_CACHE_TTL) {
+export function cacheNameserverIPs(
+    hostname,
+    ips,
+    ttlMs = NAMESERVER_IP_CACHE_TTL,
+    gluePolicy = 'strict'
+) {
     if (!hostname || !ips || ips.length === 0) return;
-    nameserverIpCache.set(normalizeDnsName(hostname), { ips, expiresAt: Date.now() + ttlMs });
+    nameserverIpCache.set(
+        getNameserverResolutionKey(hostname, gluePolicy),
+        { ips, expiresAt: Date.now() + ttlMs }
+    );
 }
 
 export function getKnownAddress(knownAddresses, hostname, family = 'any') {
@@ -616,6 +628,7 @@ export async function resolveDnsServerAddress(
 // NS 名の IP アドレス解決専用の入り口。グルー不足時の再帰呼び出しで循環参照を検出する。
 export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const normalized = normalizeDnsName(hostname);
+    const gluePolicy = dependencies.gluePolicy || 'strict';
     if (net.isIP(normalized)) {
         return isIPv6(normalized) ? null : normalized;
     }
@@ -623,7 +636,7 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const known = getKnownAddress(dependencies.knownAddresses, normalized, 'A');
     if (known && known.length > 0) return known[0];
 
-    const cached = getCachedNameserverIPs(normalized);
+    const cached = getCachedNameserverIPs(normalized, gluePolicy);
     if (cached && cached.length > 0) {
         const v4 = cached.find(ip => !isIPv6(ip));
         if (v4) return v4;
@@ -634,8 +647,9 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
         return null; // 循環参照 (グルーレコード不足の可能性)
     }
 
-    if (inFlightIpv4Resolutions.has(normalized)) {
-        return inFlightIpv4Resolutions.get(normalized);
+    const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
+    if (inFlightIpv4Resolutions.has(resolutionKey)) {
+        return inFlightIpv4Resolutions.get(resolutionKey);
     }
 
     const nextStack = new Set(resolvingStack).add(normalized);
@@ -645,23 +659,24 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
         const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
         const ips = await resolveRecordFromRoot(normalized, 'A', dnsResponseCache, childDependencies);
         if (ips.length > 0) {
-            cacheNameserverIPs(normalized, ips);
+            cacheNameserverIPs(normalized, ips, NAMESERVER_IP_CACHE_TTL, gluePolicy);
             return ips[0];
         }
         return null;
     })();
 
-    inFlightIpv4Resolutions.set(normalized, promise);
+    inFlightIpv4Resolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightIpv4Resolutions.delete(normalized);
+        inFlightIpv4Resolutions.delete(resolutionKey);
     }
 }
 
 // NS 名の IPv6 アドレス解決専用の入り口。IPv4 glue が無い委任でも AAAA glue/応答を辿れるようにする。
 export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const normalized = normalizeDnsName(hostname);
+    const gluePolicy = dependencies.gluePolicy || 'strict';
     if (net.isIP(normalized)) {
         return isIPv6(normalized) ? normalized : null;
     }
@@ -669,7 +684,7 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const known = getKnownAddress(dependencies.knownAddresses, normalized, 'AAAA');
     if (known && known.length > 0) return known[0];
 
-    const cached = getCachedNameserverIPs(normalized);
+    const cached = getCachedNameserverIPs(normalized, gluePolicy);
     if (cached && cached.length > 0) {
         const v6 = cached.find(ip => isIPv6(ip));
         if (v6) return v6;
@@ -678,8 +693,9 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const resolvingStack = dependencies.resolvingStack || new Set();
     if (resolvingStack.has(normalized)) return null;
 
-    if (inFlightIpv6Resolutions.has(normalized)) {
-        return inFlightIpv6Resolutions.get(normalized);
+    const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
+    if (inFlightIpv6Resolutions.has(resolutionKey)) {
+        return inFlightIpv6Resolutions.get(resolutionKey);
     }
 
     const nextStack = new Set(resolvingStack).add(normalized);
@@ -689,29 +705,30 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
         const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
         const ips = await resolveRecordFromRoot(normalized, 'AAAA', dnsResponseCache, childDependencies);
         if (ips.length > 0) {
-            cacheNameserverIPs(normalized, ips);
+            cacheNameserverIPs(normalized, ips, NAMESERVER_IP_CACHE_TTL, gluePolicy);
             return ips[0];
         }
         return null;
     })();
 
-    inFlightIpv6Resolutions.set(normalized, promise);
+    inFlightIpv6Resolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightIpv6Resolutions.delete(normalized);
+        inFlightIpv6Resolutions.delete(resolutionKey);
     }
 }
 
 // フルサービスリゾルバ (OS のスタブリゾルバ経由) には依存せず、ルートサーバーから自前で NS 名を解決する。
 export async function resolveServerIPs(nsName, dependencies = {}) {
     const normalized = normalizeDnsName(nsName);
+    const gluePolicy = dependencies.gluePolicy || 'strict';
     if (net.isIP(normalized)) return [normalized];
 
     const known = getKnownAddress(dependencies.knownAddresses, normalized);
     if (known && known.length > 0) return known;
 
-    const cached = getCachedNameserverIPs(normalized);
+    const cached = getCachedNameserverIPs(normalized, gluePolicy);
     if (cached) return cached;
 
     const resolvingStack = dependencies.resolvingStack || new Set();
@@ -719,8 +736,9 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
         return null; // 循環参照 (グルーレコード不足の可能性)
     }
 
-    if (inFlightServerResolutions.has(normalized)) {
-        return inFlightServerResolutions.get(normalized);
+    const resolutionKey = getNameserverResolutionKey(normalized, gluePolicy);
+    if (inFlightServerResolutions.has(resolutionKey)) {
+        return inFlightServerResolutions.get(resolutionKey);
     }
 
     const nextStack = new Set(resolvingStack).add(normalized);
@@ -734,14 +752,14 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
         ]);
         const ips = [...v4, ...v6];
         if (ips.length === 0) return null;
-        cacheNameserverIPs(normalized, ips);
+        cacheNameserverIPs(normalized, ips, NAMESERVER_IP_CACHE_TTL, gluePolicy);
         return ips;
     })();
 
-    inFlightServerResolutions.set(normalized, promise);
+    inFlightServerResolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        inFlightServerResolutions.delete(normalized);
+        inFlightServerResolutions.delete(resolutionKey);
     }
 }
