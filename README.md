@@ -26,8 +26,9 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 - `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID・question・(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
-- `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
+- `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい
+- `resolveRecordFromRoot` の `dependencies.gluePolicy`: 既定の `strict` は in-domain glue のみを利用。RFC 9471 §2.3 の循環 sibling 委任を扱う場合は `allow-sibling` を明示すると sibling glue も利用する
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
 - `getReferralAddressRecords`: 委任応答の追加セクションから、委任 owner name 配下の NS ターゲットに対する strict glue だけを抽出。out-of-bailiwick のアドレスは無視し、NS 名を権威サーバーから自己解決する
 - `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ。成功応答は応答内レコードの TTL と上限値(既定 30秒)の小さい方でキャッシュされ、タイムアウトは短時間 (既定 2秒) のみキャッシュされる (恒久的な障害固定を防ぐため `Infinity` にはしない)

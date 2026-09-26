@@ -16,6 +16,7 @@ import {
     resolveRecordFromRoot,
     resolveServerIPs,
     resolveHostnameIPv4Self,
+    resolveHostnameIPv6Self,
     resolveRecordFromServer,
     resolveDnsServerAddressByType,
     resolveDnsServerAddress,
@@ -365,6 +366,78 @@ test('out-of-bailiwick referral address is ignored and recursively resolved', as
     assert.deepEqual(result, ['ns1.example.com']);
     assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.31']);
     assert.deepEqual(resolvedHosts, ['a.gtld-servers.net']);
+});
+
+test('allow-sibling policy uses out-of-bailiwick referral address', async () => {
+    const calls = [];
+    const resolvedHosts = [];
+    const result = await resolveRecordFromRoot('example.com', 'NS', new Map(), {
+        gluePolicy: 'allow-sibling',
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'com', type: 'NS', data: 'a.gtld-servers.net' }
+                    ],
+                    additionals: [
+                        { name: 'a.gtld-servers.net', type: 'A', data: '192.5.6.30' }
+                    ]
+                };
+            }
+            assert.equal(serverIp, '192.5.6.30');
+            return {
+                answers: [{ name: domain, type: 'NS', data: 'ns1.example.com' }]
+            };
+        },
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(hostname);
+            return null;
+        }
+    });
+
+    assert.deepEqual(result, ['ns1.example.com']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.5.6.30']);
+    assert.deepEqual(resolvedHosts, []);
+});
+
+test('all referral addresses are tried and missing IPv4 glue falls back to IPv6 resolution', async () => {
+    const calls = [];
+    const resolvedHosts = [];
+    const result = await resolveRecordFromRoot('target.example.test', 'A', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'example.test', type: 'NS', data: 'ns1.example.test' },
+                        { name: 'example.test', type: 'NS', data: 'ns2.example.test' }
+                    ],
+                    additionals: [
+                        { name: 'ns1.example.test', type: 'A', data: '192.0.2.41' },
+                        { name: 'ns1.example.test', type: 'AAAA', data: '2001:db8::41' }
+                    ]
+                };
+            }
+            if (serverIp === '192.0.2.41' || serverIp === '2001:db8::41') {
+                return { error: 'SOCKET_ERROR' };
+            }
+            assert.equal(serverIp, '2001:db8::42');
+            return { answers: [{ name: domain, type: 'A', data: '192.0.2.43' }] };
+        },
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(`A:${hostname}`);
+            return null;
+        },
+        resolveHostnameIPv6Self: async hostname => {
+            resolvedHosts.push(`AAAA:${hostname}`);
+            return hostname === 'ns2.example.test' ? '2001:db8::42' : null;
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.43']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.0.2.41', '2001:db8::41', '2001:db8::42']);
+    assert.deepEqual(resolvedHosts, ['A:ns2.example.test', 'AAAA:ns2.example.test']);
 });
 
 test('resolveServerIPs returns knownAddresses without root resolution', async () => {

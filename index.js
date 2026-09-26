@@ -35,9 +35,22 @@ export function isInBailiwickGlue(record, nsNames, delegatedZone) {
 
 // 委任 owner name より下にある NS ターゲットの glue だけを、次の問い合わせ先に使う。
 // out-of-bailiwick な追加レコードは authoritative な A/AAAA 解決を迂回するため利用しない。
-export function getReferralAddressRecords(additionals, nsNames, delegatedZone) {
+export function getReferralAddressRecords(
+    additionals,
+    nsNames,
+    delegatedZone,
+    gluePolicy = 'strict'
+) {
+    if (gluePolicy === 'strict') {
+        return additionals.filter(record =>
+            isInBailiwickGlue(record, nsNames, delegatedZone));
+    }
+    if (gluePolicy !== 'allow-sibling') {
+        throw new Error(`未対応の gluePolicy です: ${gluePolicy}`);
+    }
     return additionals.filter(record =>
-    isInBailiwickGlue(record, nsNames, delegatedZone));
+        (record.type === 'A' || record.type === 'AAAA') &&
+        nsNames.includes(normalizeDnsName(record.name)));
 }
 
 export const DNS_CACHE_TTL = {
@@ -367,6 +380,7 @@ export const NAMESERVER_IP_CACHE_TTL = 300000; // レコードに TTL が無い�
 const nameserverIpCache = new Map(); // 正規化ホスト名 -> { ips, expiresAt }
 const inFlightServerResolutions = new Map(); // 同一ホスト名の並行解決合流用 (Singleflight)
 const inFlightIpv4Resolutions = new Map();   // 同一ホスト名の並行解決合流用 (Singleflight)
+const inFlightIpv6Resolutions = new Map();   // 同一ホスト名の並行解決合流用 (Singleflight)
 
 export function getCachedNameserverIPs(hostname) {
     const key = normalizeDnsName(hostname);
@@ -436,6 +450,8 @@ export async function resolveRecordFromServer(
 export async function resolveRecordFromRoot(name, qType, dnsResponseCache, dependencies = {}) {
     const queryUDP = dependencies.queryDirectlyUDP || queryDirectlyUDP;
     const resolveIPv4 = dependencies.resolveHostnameIPv4Self || resolveHostnameIPv4Self;
+    const resolveIPv6 = dependencies.resolveHostnameIPv6Self || resolveHostnameIPv6Self;
+    const gluePolicy = dependencies.gluePolicy || 'strict';
     let queryName = normalizeDnsName(name);
     let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
     let candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip }));
@@ -444,7 +460,9 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     const useNextCandidate = async () => {
         while (candidateQueue.length > 0) {
             const candidate = candidateQueue.shift();
-            const ip = candidate.ip || await resolveIPv4(candidate.nsName, dependencies);
+            const ip = candidate.ip ||
+                await resolveIPv4(candidate.nsName, dependencies) ||
+                await resolveIPv6(candidate.nsName, dependencies);
             if (ip) {
                 currentServerIp = ip;
                 return true;
@@ -492,22 +510,30 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
 
         const nsNames = nsRecords.map(r => normalizeDnsName(r.data));
         const referralAddressByNsName = new Map();
-        getReferralAddressRecords(res.additionals || [], nsNames, nsRecords[0].name)
+        getReferralAddressRecords(
+            res.additionals || [],
+            nsNames,
+            nsRecords[0].name,
+            gluePolicy
+        )
             .forEach(record => {
                 const key = normalizeDnsName(record.name);
-                if (!referralAddressByNsName.has(key)) referralAddressByNsName.set(key, record.data);
+                const addresses = referralAddressByNsName.get(key) || [];
+                if (!addresses.includes(record.data)) addresses.push(record.data);
+                referralAddressByNsName.set(key, addresses);
             });
 
         // 参照アドレスを持つ候補を優先し、無い候補は捨てずにフォールバック用に保持する。
         // knownAddresses が指定されていれば referral アドレスがない候補の事前解決アドレスとしても参照する。
-        const candidates = nsNames
-            .map(nsName => {
-                let ip = referralAddressByNsName.get(nsName) || null;
-                if (!ip && dependencies.knownAddresses) {
-                    const known = getKnownAddress(dependencies.knownAddresses, nsName, 'A');
-                    if (known && known.length > 0) ip = known[0];
-                }
-                return { nsName, ip };
+        const candidates = nsNames.flatMap(nsName => {
+            const referralAddresses = referralAddressByNsName.get(nsName) || [];
+            const knownAddresses = dependencies.knownAddresses
+                ? getKnownAddress(dependencies.knownAddresses, nsName)
+                : [];
+            const addresses = [...new Set([...referralAddresses, ...(knownAddresses || [])])];
+            return addresses.length > 0
+                ? addresses.map(ip => ({ nsName, ip }))
+                : [{ nsName, ip: null }];
             })
             .sort((a, b) => (a.ip ? 0 : 1) - (b.ip ? 0 : 1));
         const chosen = candidates.shift();
@@ -519,7 +545,8 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
         }
 
         // グルーが無い NS 名は再帰的に自己解決する (循環参照は resolveHostnameIPv4Self 側で検出)
-        const resolvedIp = await resolveIPv4(chosen.nsName, dependencies);
+        const resolvedIp = await resolveIPv4(chosen.nsName, dependencies) ||
+            await resolveIPv6(chosen.nsName, dependencies);
         if (!resolvedIp) {
             if (await useNextCandidate()) continue;
             return [];
@@ -621,6 +648,50 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
         return await promise;
     } finally {
         inFlightIpv4Resolutions.delete(normalized);
+    }
+}
+
+// NS 名の IPv6 アドレス解決専用の入り口。IPv4 glue が無い委任でも AAAA glue/応答を辿れるようにする。
+export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
+    const normalized = normalizeDnsName(hostname);
+    if (net.isIP(normalized)) {
+        return isIPv6(normalized) ? normalized : null;
+    }
+
+    const known = getKnownAddress(dependencies.knownAddresses, normalized, 'AAAA');
+    if (known && known.length > 0) return known[0];
+
+    const cached = getCachedNameserverIPs(normalized);
+    if (cached && cached.length > 0) {
+        const v6 = cached.find(ip => isIPv6(ip));
+        if (v6) return v6;
+    }
+
+    const resolvingStack = dependencies.resolvingStack || new Set();
+    if (resolvingStack.has(normalized)) return null;
+
+    if (inFlightIpv6Resolutions.has(normalized)) {
+        return inFlightIpv6Resolutions.get(normalized);
+    }
+
+    const nextStack = new Set(resolvingStack).add(normalized);
+    const childDependencies = { ...dependencies, resolvingStack: nextStack };
+
+    const promise = (async () => {
+        const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
+        const ips = await resolveRecordFromRoot(normalized, 'AAAA', dnsResponseCache, childDependencies);
+        if (ips.length > 0) {
+            cacheNameserverIPs(normalized, ips);
+            return ips[0];
+        }
+        return null;
+    })();
+
+    inFlightIpv6Resolutions.set(normalized, promise);
+    try {
+        return await promise;
+    } finally {
+        inFlightIpv6Resolutions.delete(normalized);
     }
 }
 
