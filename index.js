@@ -39,7 +39,8 @@ export function getReferralAddressRecords(
     additionals,
     nsNames,
     delegatedZone,
-    gluePolicy = 'strict'
+    gluePolicy = 'strict',
+    serverZone = delegatedZone
 ) {
     if (gluePolicy === 'strict') {
         return additionals.filter(record =>
@@ -50,7 +51,9 @@ export function getReferralAddressRecords(
     }
     return additionals.filter(record =>
         (record.type === 'A' || record.type === 'AAAA') &&
-        nsNames.includes(normalizeDnsName(record.name)));
+        nsNames.includes(normalizeDnsName(record.name)) &&
+        (!normalizeDnsName(serverZone) ||
+            isSubdomainOrEqual(record.name, serverZone)));
 }
 
 export const DNS_CACHE_TTL = {
@@ -454,6 +457,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
     const gluePolicy = dependencies.gluePolicy || 'strict';
     let queryName = normalizeDnsName(name);
     let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
+    let currentServerZone = '.';
     let candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip }));
     const visitedNames = new Set([queryName]);
 
@@ -492,6 +496,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
             visitedNames.add(cnameTarget);
             queryName = cnameTarget;
             currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
+            currentServerZone = '.';
             candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip }));
             continue;
         }
@@ -514,7 +519,8 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
             res.additionals || [],
             nsNames,
             nsRecords[0].name,
-            gluePolicy
+            gluePolicy,
+            currentServerZone
         )
             .forEach(record => {
                 const key = normalizeDnsName(record.name);
@@ -541,6 +547,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
 
         if (chosen.ip) {
             currentServerIp = chosen.ip;
+            currentServerZone = normalizeDnsName(nsRecords[0].name);
             continue;
         }
 
@@ -552,6 +559,7 @@ export async function resolveRecordFromRoot(name, qType, dnsResponseCache, depen
             return [];
         }
         currentServerIp = resolvedIp;
+        currentServerZone = normalizeDnsName(nsRecords[0].name);
     }
 
     return [];

@@ -401,6 +401,43 @@ test('allow-sibling policy uses out-of-bailiwick referral address', async () => 
     assert.deepEqual(resolvedHosts, []);
 });
 
+test('allow-sibling rejects referral addresses outside the queried server zone', async () => {
+    const calls = [];
+    const result = await resolveRecordFromRoot('host.nested.example.test', 'A', new Map(), {
+        gluePolicy: 'allow-sibling',
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'example.test', type: 'NS', data: 'ns.example.test' }
+                    ],
+                    additionals: [
+                        { name: 'ns.example.test', type: 'A', data: '192.0.2.10' }
+                    ]
+                };
+            }
+            if (serverIp === '192.0.2.10') {
+                return {
+                    authorities: [
+                        { name: 'nested.example.test', type: 'NS', data: 'ns.outside.test' },
+                        { name: 'nested.example.test', type: 'NS', data: 'ns.sibling.example.test' }
+                    ],
+                    additionals: [
+                        { name: 'ns.outside.test', type: 'A', data: '192.0.2.11' },
+                        { name: 'ns.sibling.example.test', type: 'A', data: '192.0.2.12' }
+                    ]
+                };
+            }
+            assert.equal(serverIp, '192.0.2.12');
+            return { answers: [{ name: domain, type: 'A', data: '192.0.2.13' }] };
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.13']);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP, '192.0.2.10', '192.0.2.12']);
+});
+
 test('all referral addresses are tried and missing IPv4 glue falls back to IPv6 resolution', async () => {
     const calls = [];
     const resolvedHosts = [];
