@@ -29,7 +29,7 @@ export function hasParentChildRelationship(domainA, domainB) {
 
 export function isInBailiwickGlue(record, nsNames, delegatedZone) {
     return (record.type === 'A' || record.type === 'AAAA') &&
-        nsNames.includes(normalizeDnsName(record.name)) &&
+        nsNames.some(nsName => normalizeDnsName(nsName) === normalizeDnsName(record.name)) &&
         isSubdomainOrEqual(record.name, delegatedZone);
 }
 
@@ -42,20 +42,22 @@ export function getReferralAddressRecords(
     gluePolicy = 'strict',
     serverZone = delegatedZone
 ) {
+    const normalizedNsNames = new Set(nsNames.map(normalizeDnsName));
+    const isNsAddressRecord = record =>
+        (record.type === 'A' || record.type === 'AAAA') &&
+        normalizedNsNames.has(normalizeDnsName(record.name));
+
     if (gluePolicy === 'strict') {
         const isRootReferral = serverZone === '.';
         return additionals.filter(record =>
             isInBailiwickGlue(record, nsNames, delegatedZone) ||
-            (isRootReferral &&
-                (record.type === 'A' || record.type === 'AAAA') &&
-                nsNames.includes(normalizeDnsName(record.name))));
+            (isRootReferral && isNsAddressRecord(record)));
     }
     if (gluePolicy !== 'allow-sibling') {
         throw new Error(`未対応の gluePolicy です: ${gluePolicy}`);
     }
     return additionals.filter(record =>
-        (record.type === 'A' || record.type === 'AAAA') &&
-        nsNames.includes(normalizeDnsName(record.name)) &&
+        isNsAddressRecord(record) &&
         (!normalizeDnsName(serverZone) ||
             isSubdomainOrEqual(record.name, serverZone)));
 }

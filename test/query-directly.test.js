@@ -182,6 +182,26 @@ test('in-domain glue だけを採用する', () => {
     );
 });
 
+test('glue 判定では NS 名リストの大文字と末尾ドットを正規化する', () => {
+    const additionals = [
+        { type: 'A', name: 'NS1.Child.Example.COM.', data: '192.0.2.53' },
+        { type: 'AAAA', name: 'ns1.child.example.com', data: '2001:db8::53' }
+    ];
+
+    assert.equal(
+        isInBailiwickGlue(additionals[0], ['NS1.Child.Example.COM.'], 'CHILD.EXAMPLE.COM.'),
+        true
+    );
+    assert.deepEqual(
+        getReferralAddressRecords(
+            additionals,
+            ['NS1.Child.Example.COM.'],
+            'CHILD.EXAMPLE.COM.'
+        ),
+        additionals
+    );
+});
+
 test('root referral では委任先ゾーン外でも NS に対応する glue を採用する', () => {
     const additionals = [
         { type: 'A', name: 'a.gtld-servers.net', data: '192.0.2.53' },
