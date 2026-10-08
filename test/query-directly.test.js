@@ -381,6 +381,66 @@ test('TCP query finishes after receiving a complete message without waiting for 
     }
 });
 
+test('UDP and TCP share successful response cache entries', async () => {
+    const originalCreateConnection = net.createConnection;
+    let udpQueryCount = 0;
+    const restoreUdp = mockUdp((query, socket) => {
+        udpQueryCount++;
+        queueMicrotask(() => socket.emit('message', dnsPacket.encode({
+            type: 'response',
+            id: query.id,
+            questions: query.questions,
+            answers: [{
+                name: query.questions[0].name,
+                type: 'A',
+                ttl: 60,
+                data: '192.0.2.20'
+            }]
+        })));
+    });
+
+    try {
+        const udpFirstCache = new Map();
+        await queryDirectlyUDP('udp-first.test', '192.0.2.1', udpFirstCache, 'A');
+        net.createConnection = () => {
+            throw new Error('TCP query should use the UDP cache entry');
+        };
+        const udpCachedByTcp = await queryDirectlyTCP('udp-first.test', '192.0.2.1', udpFirstCache, 'A');
+        assert.equal(udpCachedByTcp.isCached, true);
+
+        net.createConnection = (options, onConnect) => {
+            const socket = new EventEmitter();
+            socket.destroy = () => {};
+            socket.write = buffer => {
+                const query = dnsPacket.streamDecode(buffer);
+                queueMicrotask(() => socket.emit('data', dnsPacket.streamEncode({
+                    type: 'response',
+                    id: query.id,
+                    questions: query.questions,
+                    answers: [{
+                        name: query.questions[0].name,
+                        type: 'A',
+                        ttl: 60,
+                        data: '192.0.2.21'
+                    }]
+                })));
+            };
+            queueMicrotask(onConnect);
+            return socket;
+        };
+
+        const tcpFirstCache = new Map();
+        await queryDirectlyTCP('tcp-first.test', '192.0.2.1', tcpFirstCache, 'A');
+        const udpCountAfterTcpQuery = udpQueryCount;
+        const tcpCachedByUdp = await queryDirectlyUDP('tcp-first.test', '192.0.2.1', tcpFirstCache, 'A');
+        assert.equal(tcpCachedByUdp.isCached, true);
+        assert.equal(udpQueryCount, udpCountAfterTcpQuery);
+    } finally {
+        restoreUdp();
+        net.createConnection = originalCreateConnection;
+    }
+});
+
 test('resolveRecordFromRoot forwards query options and signal to each DNS query', async () => {
     const controller = new AbortController();
     const receivedOptions = [];

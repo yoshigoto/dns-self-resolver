@@ -24,22 +24,22 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 提供する機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID・question・(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける。`timeoutMs` と `AbortSignal` を指定可能
+- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID が一致しない応答、question が存在して問い合わせ内容と一致しない応答、(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける。question が省略された応答は transaction ID が一致すれば受け入れる。`timeoutMs` と `AbortSignal` を指定可能
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい
 - `resolveRecordFromRoot` の `dependencies.gluePolicy`: 既定の `strict` は委任先ゾーン内の glue と root referral が返す TLD NS glue を利用。RFC 9471 §2.3 の循環 sibling 委任を扱う場合は `allow-sibling` を明示すると、問い合わせ中のサーバーゾーン配下にある sibling glue も利用する
 - `isInBailiwickGlue` / `hasParentChildRelationship` / `isSubdomainOrEqual` / `normalizeDnsName`: ドメイン名比較・グルー(bailiwick)判定
 - `getReferralAddressRecords`: 委任応答の追加セクションからglueを抽出。NS名・レコード名は大文字小文字と末尾ドットを正規化して比較する。`strict` は委任 owner name 配下を許可し、root referral では `serverZone: '.'` を渡すと root が返す NS glue も許可する。`allow-sibling` は問い合わせ元ゾーン配下までを許可する。問い合わせ元ゾーンが省略された場合は委任ゾーン内に限定する
-- `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ。成功応答は応答内レコードの TTL と上限値(既定 30秒)の小さい方でキャッシュされ、タイムアウトは短時間 (既定 2秒) のみキャッシュされる (恒久的な障害固定を防ぐため `Infinity` にはしない)
+- `DNS_CACHE_TTL` / `getCacheEntry` / `setCacheEntry`: 呼び出し側が用意する `Map` を使った DNS 応答キャッシュ。UDP/TCP ともに完全な `NOERROR` 応答を応答内レコードの TTL と上限値(既定 30秒)の小さい方でキャッシュする。切り詰められた UDP 応答は TCP フォールバックし、タイムアウトは短時間 (既定 2秒) のみキャッシュされる (恒久的な障害固定を防ぐため `Infinity` にはしない)
 
 ## エラー形式
 
-`queryDirectlyUDP` / `queryDirectlyTCP` はエラー時に次の形の構造化オブジェクトを返します。
+`queryDirectlyUDP` / `queryDirectlyTCP` はエラー時に構造化オブジェクトを返します。通常のエラーは次の形です。
 
 ```js
 {
-  error: 'TIMEOUT', // 'TIMEOUT' | 'ABORTED' | 'SOCKET_ERROR' | 'SEND_ERROR' | 'DECODE_ERROR' | 'TCP_FALLBACK_ERROR'
+  error: 'TIMEOUT', // 'TIMEOUT' | 'ABORTED' | 'SOCKET_ERROR' | 'SEND_ERROR' | 'DECODE_ERROR'
   name: 'example.com',
   serverIp: '192.0.2.1',
   qType: 'A',
@@ -48,6 +48,8 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
   detail: '...' // 例外メッセージ等 (存在する場合)
 }
 ```
+
+UDP からの TCP フォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。この場合は `error`、`detail`、`transport: 'tcp'`、`retryFrom: 'udp-truncated'`、`isFallback: true` を含み、通常のエラー形式にある `name`、`serverIp`、`qType`、`retryable` は含みません。
 
 
 ## 使い方

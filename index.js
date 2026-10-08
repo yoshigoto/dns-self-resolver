@@ -245,7 +245,9 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                         }
 
                         const tcpSuccess = { ...decoded, transport: 'tcp' };
-                        setCacheEntry(dnsResponseCache, cacheKey, tcpSuccess, computeSuccessTtlMs(decoded));
+                        if (decoded.rcode === 'NOERROR') {
+                            setCacheEntry(dnsResponseCache, cacheKey, tcpSuccess, computeSuccessTtlMs(decoded));
+                        }
                         return finish(tcpSuccess);
                     } catch (e) {
                         const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'tcp', detail: e.message, retryable: false });
@@ -367,9 +369,6 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
                     })
                         .then(result => finish({ ...result, retryWithoutEdns: true }));
                 }
-                const answers = decoded.answers || [];
-                const authorities = decoded.authorities || [];
-
                 const TC_FLAG = dnsPacket.TRUNCATED_RESPONSE;
                 const isTruncated = (decoded.flags & TC_FLAG) !== 0;
 
@@ -398,8 +397,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
                     return fallback();
                 }
 
-                const hasNsRecord = [...answers, ...authorities].some(r => r.type === 'NS' && hasParentChildRelationship(domain, r.name));
-                if (hasNsRecord) {
+                if (decoded.rcode === 'NOERROR') {
                     setCacheEntry(dnsResponseCache, cacheKey, decoded, computeSuccessTtlMs(decoded));
                 }
 
