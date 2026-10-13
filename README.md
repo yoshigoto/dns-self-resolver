@@ -24,7 +24,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 提供する機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID が一致しない応答、question が存在して問い合わせ内容と一致しない応答、(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける。question が省略された応答は transaction ID が一致すれば受け入れる。`timeoutMs` と `AbortSignal` を指定可能
+- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID は暗号論的乱数 (`crypto.randomInt`) で生成する。transaction ID が一致しない応答、question が存在して問い合わせ内容と一致しない応答、(UDP の場合) 送信元アドレスが一致しない応答は無視して正規の応答を待ち続ける。question が省略された応答は、transaction ID が一致する FORMERR 応答のみ受け入れる。`timeoutMs` と `AbortSignal` を指定可能
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい

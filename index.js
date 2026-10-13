@@ -5,6 +5,7 @@
 
 import net from 'net';
 import dgram from 'dgram';
+import { randomInt } from 'crypto';
 import dnsPacket from 'dns-packet';
 
 export function isIPv6(ip) {
@@ -144,12 +145,18 @@ function getAdditionals(options) {
     }];
 }
 
+// キャッシュポイズニング対策として、予測困難な暗号論的乱数で 16 bit の id を生成する
+function createQueryId() {
+    return randomInt(0, 65536);
+}
+
 // 遅延して届いた別クエリの応答や偽装応答を拾わないよう、id と question を照合する
 function isMatchingResponse(decoded, queryId, domain, qType) {
     if (decoded.id !== queryId) return false;
     const question = decoded.questions?.[0];
-    // FORMERR 等では question セクションが省略される実装があるため、その場合は id 一致のみで許容する
-    if (!question) return true;
+    // FORMERR では question セクションが省略される実装があるため、その場合のみ id 一致で許容する
+    // (FORMERR はレコードを含まずキャッシュもされないため、偽装されてもキャッシュポイズニングには使えない)
+    if (!question) return decoded.rcode === 'FORMERR';
     return question.type === qType && normalizeDnsName(question.name) === normalizeDnsName(domain);
 }
 
@@ -198,7 +205,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
             options.signal.addEventListener('abort', abortHandler, { once: true });
         }
 
-        const queryId = Math.floor(Math.random() * 65534);
+        const queryId = createQueryId();
 
         try {
             const tcpBuf = dnsPacket.streamEncode({
@@ -310,7 +317,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
             options.signal.addEventListener('abort', abortHandler, { once: true });
         }
 
-        const queryId = Math.floor(Math.random() * 65534);
+        const queryId = createQueryId();
 
         try {
             const buf = dnsPacket.encode({

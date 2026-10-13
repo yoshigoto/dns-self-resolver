@@ -1066,3 +1066,46 @@ test('structured errors include serverIp, name, qType and retryable', async () =
         restoreUdp();
     }
 });
+test('response without question section is ignored unless it is FORMERR', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            // id が一致しても question を省略した NOERROR 応答 (偽装の可能性) は受理しない
+            const forged = dnsPacket.encode({
+                type: 'response',
+                id: query.id,
+                answers: [{ name: query.questions[0].name, type: 'NS', data: 'forged.test' }]
+            });
+            socket.emit('message', forged, { address: '192.0.2.1', port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('no-question.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('transaction IDs are generated with a CSPRNG instead of Math.random', async () => {
+    const ids = [];
+    const originalRandom = Math.random;
+    Math.random = () => 0;
+    const restoreUdp = mockUdp((query, socket) => {
+        ids.push(query.id);
+        queueMicrotask(() => socket.emit('message', createDnsResponse(query)));
+    });
+
+    try {
+        for (let i = 0; i < 4; i++) {
+            await queryDirectlyUDP(`txid-${i}.test`, '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        }
+        assert.equal(ids.length, 4);
+        assert.ok(ids.every(id => Number.isInteger(id) && id >= 0 && id <= 65535));
+        assert.ok(new Set(ids).size > 1, `transaction IDs must not be predictable: ${ids.join(', ')}`);
+    } finally {
+        Math.random = originalRandom;
+        restoreUdp();
+    }
+});
