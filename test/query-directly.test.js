@@ -21,6 +21,9 @@ import {
     resolveRecordFromServer,
     resolveDnsServerAddressByType,
     resolveDnsServerAddress,
+    getKnownAddress,
+    getCachedNameserverIPs,
+    RESOLUTION_LIMITS,
     ROOT_SERVER_BOOTSTRAP_IP
 } from '../index.js';
 
@@ -81,6 +84,7 @@ function mockUdp(onQuery) {
     dgram.createSocket = () => {
         const socket = new EventEmitter();
         socket.close = () => {};
+        socket.bind = (options, callback) => queueMicrotask(callback);
         socket.send = (buffer, offset, length, port, host, callback) => {
             callback?.(null);
             onQuery(dnsPacket.decode(buffer), socket, host);
@@ -472,6 +476,7 @@ test('queryDirectlyUDP closes its socket when aborted', async () => {
     dgram.createSocket = () => {
         const socket = new EventEmitter();
         socket.close = () => { closed = true; };
+        socket.bind = (options, callback) => queueMicrotask(callback);
         socket.send = (buffer, offset, length, port, host, callback) => callback?.(null);
         return socket;
     };
@@ -1108,4 +1113,412 @@ test('transaction IDs are generated with a CSPRNG instead of Math.random', async
         Math.random = originalRandom;
         restoreUdp();
     }
+});
+
+test('NXNS: glueless NS names resolved per referral are capped', async () => {
+    const resolvedHosts = [];
+    const nsRecords = Array.from({ length: 50 }, (_, i) =>
+        ({ name: 'nxns-attacker.test', type: 'NS', data: `x${i}.victim.test` }));
+
+    const result = await resolveRecordFromRoot('www.nxns-attacker.test', 'A', new Map(), {
+        queryDirectlyUDP: async () => ({ authorities: nsRecords, additionals: [] }),
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(hostname);
+            return null;
+        },
+        resolveHostnameIPv6Self: async () => null
+    });
+
+    assert.deepEqual(result, []);
+    assert.equal(resolvedHosts.length, RESOLUTION_LIMITS.maxGluelessNsPerReferral);
+});
+
+test('NXNS: nested glueless resolutions share a bounded query budget', async () => {
+    let queryCount = 0;
+    let nsCounter = 0;
+    // 毎回 glue なしの新しい NS 名を大量に返して入れ子解決を誘発する悪性サーバー
+    const queryUDP = async (domain) => {
+        queryCount++;
+        const zone = domain.split('.').slice(-2).join('.');
+        return {
+            authorities: Array.from({ length: 10 }, () =>
+                ({ name: zone, type: 'NS', data: `ns${nsCounter++}.amp${nsCounter}.test` })),
+            additionals: []
+        };
+    };
+
+    const result = await resolveRecordFromRoot('www.budget-attacker.test', 'A', new Map(), {
+        queryDirectlyUDP: queryUDP,
+        resolutionLimits: { maxQueriesPerResolution: 30 }
+    });
+
+    assert.deepEqual(result, []);
+    assert.ok(queryCount <= 30, `query count must be bounded by the budget: ${queryCount}`);
+});
+
+test('getKnownAddress ignores prototype properties and invalid values', () => {
+    const knownAddresses = { 'ns.ok.test': ['192.0.2.1', 'not-an-ip', { evil: true }] };
+    assert.equal(getKnownAddress(knownAddresses, 'constructor'), null);
+    assert.equal(getKnownAddress(knownAddresses, '__proto__'), null);
+    assert.equal(getKnownAddress(knownAddresses, 'toString'), null);
+    assert.deepEqual(getKnownAddress(knownAddresses, 'ns.ok.test'), ['192.0.2.1']);
+});
+
+test('referral to an NS named like a prototype property does not crash resolution', async () => {
+    const calls = [];
+    const result = await resolveRecordFromRoot('www.proto.test', 'A', new Map(), {
+        knownAddresses: { 'ns.other.test': '192.0.2.1' },
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'proto.test', type: 'NS', data: 'constructor' }],
+                    additionals: []
+                };
+            }
+            throw new Error(`unexpected server ${serverIp}`);
+        },
+        resolveHostnameIPv4Self: async () => null,
+        resolveHostnameIPv6Self: async () => null
+    });
+
+    assert.deepEqual(result, []);
+    assert.deepEqual(calls, [ROOT_SERVER_BOOTSTRAP_IP]);
+});
+
+test('exceptions thrown by a query function are treated as a failed server', async () => {
+    const calls = [];
+    const result = await resolveRecordFromRoot('www.throw.test', 'A', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (calls.length === 1) throw new TypeError('boom');
+            return { flags: 1024, answers: [{ name: domain, type: 'A', data: '192.0.2.70' }] };
+        }
+    });
+
+    assert.deepEqual(result, ['192.0.2.70']);
+    assert.equal(calls.length, 2);
+});
+
+test('upward and sideways referrals are rejected as lame', async () => {
+    const calls = [];
+    const result = await resolveRecordFromRoot('www.example.test', 'A', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp) => {
+            calls.push(serverIp);
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'example.test', type: 'NS', data: 'ns.example.test' }],
+                    additionals: [{ name: 'ns.example.test', type: 'A', data: '192.0.2.10' }]
+                };
+            }
+            if (serverIp === '192.0.2.10') {
+                // 委任先サーバーが無関係なゾーンへの referral を返す (偽装/lame)
+                return {
+                    authorities: [{ name: 'attacker.test', type: 'NS', data: 'ns.attacker.test' }],
+                    additionals: [{ name: 'ns.attacker.test', type: 'A', data: '203.0.113.66' }]
+                };
+            }
+            throw new Error(`must not query ${serverIp}`);
+        }
+    });
+
+    assert.deepEqual(result, []);
+    assert.ok(!calls.includes('203.0.113.66'));
+});
+
+test('nameserver IP cache is isolated from callers that inject knownAddresses', async () => {
+    const hostname = 'www.scope-victim.test';
+    const queries = [];
+    const queryUDP = async (domain, serverIp, cache, qType) => {
+        queries.push(serverIp);
+        if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+            return {
+                authorities: [{ name: 'scope-victim.test', type: 'NS', data: 'ns.provider.test' }],
+                additionals: []
+            };
+        }
+        const data = serverIp === '203.0.113.66' ? '203.0.113.99' : '192.0.2.99';
+        return { flags: 1024, answers: [{ name: domain, type: qType, data }] };
+    };
+
+    const resolveNs = async () => '192.0.2.53';
+
+    const attacker = await resolveHostnameIPv4Self(hostname, {
+        knownAddresses: { 'ns.provider.test': '203.0.113.66' },
+        queryDirectlyUDP: queryUDP,
+        resolveHostnameIPv4Self: resolveNs
+    });
+    assert.equal(attacker, '203.0.113.99');
+
+    const victim = await resolveHostnameIPv4Self(hostname, {
+        queryDirectlyUDP: queryUDP,
+        resolveHostnameIPv4Self: resolveNs
+    });
+    assert.equal(victim, '192.0.2.99');
+});
+
+test('nameserver IP cache honours record TTL', async () => {
+    const hostname = 'ttl-zero-ns.example.test';
+    let queryCount = 0;
+    const queryUDP = async (domain, serverIp, cache, qType) => {
+        queryCount++;
+        return { flags: 1024, answers: [{ name: domain, type: qType, ttl: 0, data: '192.0.2.81' }] };
+    };
+
+    assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), '192.0.2.81');
+    assert.equal(getCachedNameserverIPs(hostname, 'strict', { queryDirectlyUDP: queryUDP }), null);
+    assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), '192.0.2.81');
+    assert.equal(queryCount, 2);
+});
+
+test('failed nameserver resolution is negatively cached for a short time', async () => {
+    const hostname = 'nx-ns.example.test';
+    let queryCount = 0;
+    const queryUDP = async () => {
+        queryCount++;
+        return { flags: 1024, rcode: 'NXDOMAIN', answers: [] };
+    };
+
+    assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), null);
+    assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), null);
+    assert.equal(queryCount, 1);
+});
+
+test('nested NS resolution reuses the caller response cache', async () => {
+    const cache = new Map();
+    const seenCaches = new Set();
+    await resolveRecordFromRoot('www.shared-cache.test', 'A', cache, {
+        queryDirectlyUDP: async (domain, serverIp, usedCache, qType) => {
+            seenCaches.add(usedCache);
+            if (domain === 'www.shared-cache.test' && serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'shared-cache.test', type: 'NS', data: 'ns.glueless-provider.test' }],
+                    additionals: []
+                };
+            }
+            return { flags: 1024, answers: [{ name: domain, type: qType, data: qType === 'A' ? '192.0.2.31' : '2001:db8::31' }] };
+        }
+    });
+
+    assert.deepEqual([...seenCaches], [cache]);
+});
+
+test('UDP: malformed datagram with matching ID does not abort the query', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            const garbage = Buffer.alloc(14, 0xff);
+            garbage.writeUInt16BE(query.id, 0);
+            socket.emit('message', garbage, { address: '192.0.2.1', port: 53 });
+            socket.emit('message', Buffer.from([1, 2, 3]), { address: '192.0.2.1', port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('malformed-spoof.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.error, undefined);
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP: only malformed responses result in DECODE_ERROR after the timeout', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            const garbage = Buffer.alloc(14, 0xff);
+            garbage.writeUInt16BE(query.id, 0);
+            socket.emit('message', garbage, { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('malformed-only.test', '192.0.2.1', new Map(), 'NS', { useEdns: false, timeoutMs: 20 });
+        assert.equal(result.error, 'DECODE_ERROR');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP: response from an unexpected source port is ignored', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        queueMicrotask(() => {
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 5353 });
+            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('spoofed-port.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP: source port is randomized with a CSPRNG', async () => {
+    const originalCreateSocket = dgram.createSocket;
+    const ports = [];
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => {};
+        socket.bind = (options, callback) => {
+            ports.push(options.port);
+            queueMicrotask(callback);
+        };
+        socket.send = (buffer, offset, length, port, host, callback) => {
+            callback?.(null);
+            const query = dnsPacket.decode(buffer);
+            queueMicrotask(() => socket.emit('message', createDnsResponse(query)));
+        };
+        return socket;
+    };
+
+    try {
+        for (let i = 0; i < 4; i++) {
+            await queryDirectlyUDP(`port-${i}.test`, '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        }
+        assert.equal(ports.length, 4);
+        assert.ok(ports.every(port => Number.isInteger(port) && port >= 1024 && port <= 65535));
+        assert.ok(new Set(ports).size > 1, `source ports must not be predictable: ${ports.join(', ')}`);
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
+});
+
+test('UDP: 0x20 randomizes the query name case and restores it in the result', async () => {
+    const sentNames = [];
+    const restoreUdp = mockUdp((query, socket) => {
+        sentNames.push(query.questions[0].name);
+        queueMicrotask(() => socket.emit('message', createDnsResponse(query)));
+    });
+
+    try {
+        let result;
+        for (let i = 0; i < 4; i++) {
+            result = await queryDirectlyUDP(`case-randomization-${i}.example.test`, '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        }
+        assert.ok(sentNames.some(name => name !== name.toLowerCase()), sentNames.join(', '));
+        assert.equal(result.questions[0].name, 'case-randomization-3.example.test');
+        assert.equal(result.answers[0].name, 'case-randomization-3.example.test');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP: 0x20 case-mismatched response is rejected, then retried without 0x20', async () => {
+    const queries = [];
+    const restoreUdp = mockUdp((query, socket) => {
+        queries.push(query);
+        const lowered = { ...query, questions: [{ ...query.questions[0], name: query.questions[0].name.toLowerCase() }] };
+        const forged = dnsPacket.encode({
+            type: 'response',
+            id: query.id,
+            questions: lowered.questions,
+            answers: [{ name: lowered.questions[0].name, type: 'NS', data: 'case-insensitive-server.test' }]
+        });
+        queueMicrotask(() => socket.emit('message', forged, { address: '192.0.2.1', port: 53 }));
+    });
+
+    try {
+        const name = 'abcdefghijklmnopqrstuvwxyz.example.test';
+        const result = await queryDirectlyUDP(name, '192.0.2.1', new Map(), 'NS', { useEdns: false, timeoutMs: 20 });
+        assert.equal(queries.length, 2);
+        assert.notEqual(queries[0].questions[0].name, name);
+        assert.equal(queries[1].questions[0].name, name);
+        assert.equal(result.caseRandomizationFallback, true);
+        assert.equal(result.answers[0].data, 'case-insensitive-server.test');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('queryDirectlyUDP rejects non-IP server addresses without throwing', async () => {
+    const result = await queryDirectlyUDP('example.test', { toString: () => 'x' }, new Map(), 'A');
+    assert.equal(result.error, 'SEND_ERROR');
+    assert.equal(result.retryable, false);
+});
+
+test('TCP: messages with a mismatched ID are skipped before decoding', async () => {
+    const originalCreateConnection = net.createConnection;
+    net.createConnection = (options, onConnect) => {
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        socket.write = (buffer) => {
+            const query = dnsPacket.streamDecode(buffer);
+            const junk = Buffer.alloc(16, 0xff);
+            junk.writeUInt16BE(14, 0);
+            junk.writeUInt16BE((query.id + 1) % 65536, 2);
+            const response = dnsPacket.streamEncode({
+                type: 'response',
+                id: query.id,
+                questions: query.questions,
+                answers: [{ name: 'tcp-junk.test', type: 'A', data: '192.0.2.12' }]
+            });
+            queueMicrotask(() => socket.emit('data', Buffer.concat([junk, response])));
+        };
+        queueMicrotask(onConnect);
+        return socket;
+    };
+
+    try {
+        const result = await queryDirectlyTCP('tcp-junk.test', '192.0.2.3', new Map(), 'A', { timeoutMs: 100 });
+        assert.equal(result.error, undefined);
+        assert.equal(result.answers[0].data, '192.0.2.12');
+    } finally {
+        net.createConnection = originalCreateConnection;
+    }
+});
+
+test('UDP without 0x20 accepts responses whose question differs only in case', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        const lowered = [{ ...query.questions[0], name: query.questions[0].name.toLowerCase() }];
+        queueMicrotask(() => socket.emit('message', dnsPacket.encode({
+            type: 'response',
+            id: query.id,
+            questions: lowered,
+            answers: [{ name: lowered[0].name, type: 'NS', data: 'lowercasing-server.test' }]
+        }), { address: '192.0.2.1', port: 53 }));
+    });
+
+    try {
+        const result = await queryDirectlyUDP('Mixed-Case.Example.TEST', '192.0.2.1', new Map(), 'NS', {
+            useEdns: false,
+            use0x20: false,
+            timeoutMs: 50
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.answers[0].data, 'lowercasing-server.test');
+
+        const fallback = await queryDirectlyUDP('Other-Mixed.Example.TEST', '192.0.2.1', new Map(), 'NS', {
+            useEdns: false,
+            timeoutMs: 20
+        });
+        assert.equal(fallback.error, undefined);
+        assert.equal(fallback.caseRandomizationFallback, true);
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('budget exhaustion does not negatively cache the nameserver name', async () => {
+    const hostname = 'ns.budget-negative.test';
+    let queryCount = 0;
+    const queryUDP = async (domain, serverIp, cache, qType) => {
+        queryCount++;
+        if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+            return {
+                authorities: [{ name: 'budget-negative.test', type: 'NS', data: 'ns1.budget-negative.test' }],
+                additionals: [{ name: 'ns1.budget-negative.test', type: 'A', data: '192.0.2.91' }]
+            };
+        }
+        return { flags: 1024, answers: [{ name: domain, type: qType, data: '192.0.2.92' }] };
+    };
+
+    assert.equal(await resolveHostnameIPv4Self(hostname, {
+        queryDirectlyUDP: queryUDP,
+        resolutionLimits: { maxQueriesPerResolution: 1 }
+    }), null);
+    assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), '192.0.2.92');
+    assert.equal(queryCount, 3);
 });
