@@ -1522,3 +1522,118 @@ test('budget exhaustion does not negatively cache the nameserver name', async ()
     assert.equal(await resolveHostnameIPv4Self(hostname, { queryDirectlyUDP: queryUDP }), '192.0.2.92');
     assert.equal(queryCount, 3);
 });
+
+test('concurrent identical UDP queries are coalesced into one packet (birthday attack mitigation)', async () => {
+    let sent = 0;
+    const restoreUdp = mockUdp((query, socket) => {
+        sent++;
+        setTimeout(() => socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 }), 5);
+    });
+
+    try {
+        const caches = Array.from({ length: 20 }, () => new Map());
+        const results = await Promise.all(caches.map(cache =>
+            queryDirectlyUDP('birthday.example.test', '192.0.2.1', cache, 'NS', { useEdns: false })));
+
+        assert.equal(sent, 1);
+        assert.ok(results.every(result => result.answers[0].data === 'a.gtld-servers.net'));
+        assert.equal(new Set(results).size, results.length, 'each caller must receive its own result object');
+        assert.ok(caches.every(cache => cache.size === 1), 'every caller cache must receive the response');
+
+        // 応答受信後の問い合わせは合流せず、新たに送信される
+        await queryDirectlyUDP('birthday.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        assert.equal(sent, 2);
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('UDP queries with different options are not coalesced', async () => {
+    let sent = 0;
+    const restoreUdp = mockUdp((query, socket) => {
+        sent++;
+        setTimeout(() => socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 }), 5);
+    });
+
+    try {
+        await Promise.all([
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: false }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: true, dnssecOk: true }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'A', { useEdns: false }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.2', new Map(), 'NS', { useEdns: false })
+        ]);
+        assert.equal(sent, 4);
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('aborting one coalesced caller does not cancel the shared query for others', async () => {
+    let closed = 0;
+    const originalCreateSocket = dgram.createSocket;
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => { closed++; };
+        socket.bind = (options, callback) => queueMicrotask(callback);
+        socket.send = (buffer, offset, length, port, host, callback) => {
+            callback?.(null);
+            const query = dnsPacket.decode(buffer);
+            setTimeout(() => socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 }), 10);
+        };
+        return socket;
+    };
+
+    try {
+        const controller = new AbortController();
+        const aborted = queryDirectlyUDP('partial-abort.example.test', '192.0.2.1', new Map(), 'NS', {
+            useEdns: false,
+            signal: controller.signal
+        });
+        const survivor = queryDirectlyUDP('partial-abort.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
+        controller.abort();
+
+        assert.equal((await aborted).error, 'ABORTED');
+        assert.equal(closed, 0, 'shared socket must stay open while another caller waits');
+        const result = await survivor;
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
+});
+
+test('the shared UDP query is cancelled once every coalesced caller aborts', async () => {
+    let closed = 0;
+    let sent = 0;
+    const originalCreateSocket = dgram.createSocket;
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => { closed++; };
+        socket.bind = (options, callback) => queueMicrotask(callback);
+        socket.send = (buffer, offset, length, port, host, callback) => {
+            sent++;
+            callback?.(null);
+        };
+        return socket;
+    };
+
+    try {
+        const first = new AbortController();
+        const second = new AbortController();
+        const pending = [first, second].map(controller =>
+            queryDirectlyUDP('all-abort.example.test', '192.0.2.1', new Map(), 'NS', {
+                useEdns: false,
+                timeoutMs: 1000,
+                signal: controller.signal
+            }));
+        first.abort();
+        assert.equal(closed, 0);
+        second.abort();
+
+        const results = await Promise.all(pending);
+        assert.ok(results.every(result => result.error === 'ABORTED'));
+        assert.equal(closed, 1);
+        assert.ok(sent <= 1);
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
+});

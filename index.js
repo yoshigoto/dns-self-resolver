@@ -410,15 +410,98 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
     });
 }
 
-export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = true) {
-    const options = normalizeQueryOptions(queryOptions, {
-        useEdns: true,
-        dnssecOk: false,
-        udpPayloadSize: 1232,
-        timeoutMs: 5000,
-        use0x20: true
-    });
+const UDP_QUERY_DEFAULTS = Object.freeze({
+    useEdns: true,
+    dnssecOk: false,
+    udpPayloadSize: 1232,
+    timeoutMs: 5000,
+    use0x20: true
+});
 
+// 応答待ちの同一 UDP 問い合わせ (サーバー・名前・タイプ・オプションが同じもの) の合流用。
+// 同じ問い合わせを並行して複数送ると、偽装応答がいずれかに一致する確率が送信数に比例して上がる
+// (誕生日攻撃, CERT VU#457875)。応答待ちの間は 1 本にまとめ、結果を全呼び出し元で共有する。
+const inFlightUdpQueries = new Map();
+
+function getUdpInFlightKey(cacheKey, options) {
+    return `${cacheKey}|udp:${options.udpPayloadSize}|0x20:${options.use0x20 ? 1 : 0}`;
+}
+
+export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = true) {
+    const options = normalizeQueryOptions(queryOptions, UDP_QUERY_DEFAULTS);
+    const callerSignal = options.signal;
+
+    if (callerSignal?.aborted) {
+        return Promise.resolve(buildAbortError({ domain, serverIp, qType, transport: 'udp', signal: callerSignal }));
+    }
+    if (!isIpLiteral(serverIp)) {
+        return Promise.resolve(buildInvalidServerError(domain, serverIp, qType, 'udp'));
+    }
+
+    const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
+    const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
+    if (cachedResult) {
+        return Promise.resolve({ ...cachedResult, isCached: true });
+    }
+
+    const inFlightKey = getUdpInFlightKey(cacheKey, options);
+    let flight = inFlightUdpQueries.get(inFlightKey);
+    if (!flight) {
+        // 実際の問い合わせは呼び出し元の signal ではなく共有用の signal で制御し、
+        // 待っている呼び出し元が全員中断した場合にだけ中断する
+        const controller = new AbortController();
+        flight = { controller, cache: dnsResponseCache, subscribers: 0, settled: false };
+        flight.promise = performUdpQuery(domain, serverIp, dnsResponseCache, qType, {
+            ...options,
+            signal: controller.signal
+        }).catch(err => buildDnsError('SOCKET_ERROR', {
+            domain, serverIp, qType, transport: 'udp', detail: err?.message, retryable: true
+        })).then((result) => {
+            flight.settled = true;
+            if (inFlightUdpQueries.get(inFlightKey) === flight) inFlightUdpQueries.delete(inFlightKey);
+            return result;
+        });
+        inFlightUdpQueries.set(inFlightKey, flight);
+    }
+
+    flight.subscribers++;
+    return new Promise((resolve) => {
+        let done = false;
+        let abortHandler = null;
+
+        const leave = () => {
+            done = true;
+            flight.subscribers--;
+            if (abortHandler) callerSignal.removeEventListener('abort', abortHandler);
+        };
+
+        if (callerSignal) {
+            abortHandler = () => {
+                if (done) return;
+                leave();
+                if (flight.subscribers === 0 && !flight.settled) {
+                    if (inFlightUdpQueries.get(inFlightKey) === flight) inFlightUdpQueries.delete(inFlightKey);
+                    flight.controller.abort(callerSignal.reason);
+                }
+                resolve(buildAbortError({ domain, serverIp, qType, transport: 'udp', signal: callerSignal }));
+            };
+            callerSignal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        flight.promise.then((result) => {
+            if (done) return;
+            leave();
+            // 合流した呼び出し元が別のキャッシュを使っている場合も、問い合わせ結果のキャッシュを反映する
+            if (dnsResponseCache && dnsResponseCache !== flight.cache) {
+                const entry = flight.cache?.get?.(cacheKey);
+                if (entry) setBounded(dnsResponseCache, cacheKey, { ...entry }, DNS_RESPONSE_CACHE_MAX_ENTRIES);
+            }
+            resolve({ ...result });
+        });
+    });
+}
+
+function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
     return new Promise((resolve) => {
         if (options.signal?.aborted) {
             return resolve(buildAbortError({ domain, serverIp, qType, transport: 'udp', signal: options.signal }));
