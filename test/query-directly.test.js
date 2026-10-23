@@ -42,6 +42,12 @@ function createDnsResponse(query, flags = 0) {
     });
 }
 
+const FIXED_A_RESPONSE = Buffer.from(
+    '000081800001000100000000076578616d706c6503636f6d0000010001' +
+    'c00c000100010000003c0004c000027b',
+    'hex'
+);
+
 function createDnssecDsResponse(query) {
     return dnsPacket.encode({
         type: 'response',
@@ -155,6 +161,37 @@ test('サブドメインまたは同一名だけを親子関係として判定�
 test('IPv4 と IPv6 を識別する', () => {
     assert.equal(isIPv6('2001:db8::53'), true);
     assert.equal(isIPv6('192.0.2.53'), false);
+});
+
+test('queryDirectlyUDP decodes a fixed DNS wire response', async () => {
+    const originalCreateSocket = dgram.createSocket;
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => {};
+        socket.bind = (options, callback) => queueMicrotask(callback);
+        socket.send = (buffer, offset, length, port, host, callback) => {
+            callback?.(null);
+            const response = Buffer.from(FIXED_A_RESPONSE);
+            response.writeUInt16BE(buffer.readUInt16BE(0), 0);
+            queueMicrotask(() => socket.emit('message', response, { address: host, port }));
+        };
+        return socket;
+    };
+
+    try {
+        const result = await queryDirectlyUDP('example.com', '192.0.2.1', new Map(), 'A', {
+            useEdns: false,
+            use0x20: false
+        });
+
+        assert.equal(result.error, undefined);
+        assert.deepEqual(result.answers.map(({ name, type, ttl, data }) =>
+            ({ name, type, ttl, data })), [
+            { name: 'example.com', type: 'A', ttl: 60, data: '192.0.2.123' }
+        ]);
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
 });
 
 test('in-domain glue だけを採用する', () => {
