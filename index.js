@@ -150,7 +150,7 @@ function normalizeQueryOptions(options, defaults = {}) {
 }
 
 function getDnsCacheKey(serverIp, qType, domain, options) {
-    return `${serverIp}|${qType}|${domain}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}|timeout:${options.timeoutMs}`;
+    return `${serverIp}|${qType}|${domain}|udpPort:${options.udpPort}|tcpPort:${options.tcpPort}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}|timeout:${options.timeoutMs}`;
 }
 
 function getAdditionals(options) {
@@ -235,6 +235,10 @@ const SOURCE_PORT_MIN = 1024;
 const SOURCE_PORT_MAX_EXCLUSIVE = 65536;
 const MAX_SOURCE_PORT_ATTEMPTS = 8;
 
+function isValidDnsPort(port) {
+    return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
 function bindSocket(socket, port) {
     return new Promise((resolve, reject) => {
         const onError = (err) => reject(err);
@@ -280,11 +284,24 @@ function buildInvalidServerError(domain, serverIp, qType, transport) {
     });
 }
 
+function buildInvalidPortError(domain, serverIp, qType, transport, portName) {
+    return buildDnsError('SEND_ERROR', {
+        domain,
+        serverIp,
+        qType,
+        transport,
+        detail: `${portName} must be an integer between 1 and 65535`,
+        retryable: false
+    });
+}
+
 export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = {}) {
     const options = normalizeQueryOptions(queryOptions, {
         useEdns: true,
         dnssecOk: false,
         udpPayloadSize: 1232,
+        udpPort: DNS_PORT,
+        tcpPort: DNS_PORT,
         timeoutMs: 5000
     });
 
@@ -294,6 +311,12 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
         }
         if (!isIpLiteral(serverIp)) {
             return resolve(buildInvalidServerError(domain, serverIp, qType, 'tcp'));
+        }
+        if (!isValidDnsPort(options.tcpPort)) {
+            return resolve(buildInvalidPortError(domain, serverIp, qType, 'tcp', 'tcpPort'));
+        }
+        if (!isValidDnsPort(options.udpPort)) {
+            return resolve(buildInvalidPortError(domain, serverIp, qType, 'tcp', 'udpPort'));
         }
 
         const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
@@ -338,7 +361,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                 additionals: getAdditionals(options)
             });
 
-            socket = net.createConnection({ host: serverIp, port: 53 }, () => {
+            socket = net.createConnection({ host: serverIp, port: options.tcpPort }, () => {
                 if (!settled) socket.write(tcpBuf);
             });
 
@@ -414,6 +437,8 @@ const UDP_QUERY_DEFAULTS = Object.freeze({
     useEdns: true,
     dnssecOk: false,
     udpPayloadSize: 1232,
+    udpPort: DNS_PORT,
+    tcpPort: DNS_PORT,
     timeoutMs: 5000,
     use0x20: true
 });
@@ -436,6 +461,12 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
     }
     if (!isIpLiteral(serverIp)) {
         return Promise.resolve(buildInvalidServerError(domain, serverIp, qType, 'udp'));
+    }
+    if (!isValidDnsPort(options.udpPort)) {
+        return Promise.resolve(buildInvalidPortError(domain, serverIp, qType, 'udp', 'udpPort'));
+    }
+    if (!isValidDnsPort(options.tcpPort)) {
+        return Promise.resolve(buildInvalidPortError(domain, serverIp, qType, 'udp', 'tcpPort'));
     }
 
     const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
@@ -601,7 +632,7 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
             if (settled) return;
             // 想定外の送信元アドレス・ポートからの応答 (スプーフィング等) は無視し、正規の応答を待ち続ける
             if (rinfo && (String(rinfo.address).toLowerCase() !== serverIp.toLowerCase() ||
-                (rinfo.port !== undefined && rinfo.port !== DNS_PORT))) {
+                (rinfo.port !== undefined && rinfo.port !== options.udpPort))) {
                 return;
             }
             // デコード前にヘッダの id と QR ビットを確認する。不一致のデータグラムは解析もせず破棄し、
@@ -693,7 +724,7 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 });
                 client.on('message', onMessage);
 
-                client.send(buf, 0, buf.length, DNS_PORT, serverIp, (err) => {
+                client.send(buf, 0, buf.length, options.udpPort, serverIp, (err) => {
                     if (err) {
                         const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
                         setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);

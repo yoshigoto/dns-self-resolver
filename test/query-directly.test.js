@@ -87,7 +87,7 @@ function mockUdp(onQuery) {
         socket.bind = (options, callback) => queueMicrotask(callback);
         socket.send = (buffer, offset, length, port, host, callback) => {
             callback?.(null);
-            onQuery(dnsPacket.decode(buffer), socket, host);
+            onQuery(dnsPacket.decode(buffer), socket, host, port);
         };
         return socket;
     };
@@ -305,14 +305,19 @@ test('DO query for com DS returns DS and RRSIG records', async () => {
 test('UDP truncation preserves DO during TCP fallback', async () => {
     const originalCreateConnection = net.createConnection;
     let tcpQuery;
-    const restoreUdp = mockUdp((query, socket) => {
+    let udpDestinationPort;
+    let tcpConnectionOptions;
+    const restoreUdp = mockUdp((query, socket, host, port) => {
+        udpDestinationPort = port;
         queueMicrotask(() => socket.emit(
             'message',
-            createDnsResponse(query, dnsPacket.TRUNCATED_RESPONSE)
+            createDnsResponse(query, dnsPacket.TRUNCATED_RESPONSE),
+            { address: host, port }
         ));
     });
 
     net.createConnection = (options, onConnect) => {
+        tcpConnectionOptions = options;
         const socket = new EventEmitter();
         socket.destroy = () => {};
         socket.write = (buffer) => {
@@ -331,16 +336,92 @@ test('UDP truncation preserves DO during TCP fallback', async () => {
     try {
         const result = await queryDirectlyUDP('com', '192.0.2.1', new Map(), 'DS', {
             dnssecOk: true,
-            timeoutMs: 100
+            timeoutMs: 100,
+            udpPort: 5300,
+            tcpPort: 5301
         });
 
         assert.equal(tcpQuery.additionals[0].flags, dnsPacket.DNSSEC_OK);
+        assert.equal(udpDestinationPort, 5300);
+        assert.equal(tcpConnectionOptions.port, 5301);
         assert.equal(result.transport, 'tcp');
         assert.equal(result.isFallback, true);
     } finally {
         restoreUdp();
         net.createConnection = originalCreateConnection;
     }
+});
+
+test('UDP queries use the configured port and only accept responses from that port', async () => {
+    let sentToPort;
+    const restoreUdp = mockUdp((query, socket, host, port) => {
+        sentToPort = port;
+        queueMicrotask(() => {
+            socket.emit('message', createDnsResponse(query), { address: host, port: 53 });
+            socket.emit('message', createDnsResponse(query), { address: host, port });
+        });
+    });
+
+    try {
+        const result = await queryDirectlyUDP('custom-udp-port.test', '192.0.2.1', new Map(), 'NS', {
+            useEdns: false,
+            udpPort: 5353
+        });
+
+        assert.equal(sentToPort, 5353);
+        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+    } finally {
+        restoreUdp();
+    }
+});
+
+test('TCP queries use the configured port', async () => {
+    const originalCreateConnection = net.createConnection;
+    let connectionOptions;
+
+    net.createConnection = (options, onConnect) => {
+        connectionOptions = options;
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        socket.write = buffer => {
+            const query = dnsPacket.streamDecode(buffer);
+            queueMicrotask(() => socket.emit('data', dnsPacket.streamEncode({
+                type: 'response',
+                id: query.id,
+                questions: query.questions,
+                answers: []
+            })));
+        };
+        queueMicrotask(onConnect);
+        return socket;
+    };
+
+    try {
+        const result = await queryDirectlyTCP('custom-tcp-port.test', '192.0.2.1', new Map(), 'A', {
+            tcpPort: 5354
+        });
+
+        assert.equal(connectionOptions.port, 5354);
+        assert.equal(result.transport, 'tcp');
+    } finally {
+        net.createConnection = originalCreateConnection;
+    }
+});
+
+test('invalid DNS ports return SEND_ERROR without opening a socket', async () => {
+    const udpResult = await queryDirectlyUDP('invalid-port.test', '192.0.2.1', new Map(), 'A', {
+        udpPort: 0
+    });
+    const tcpResult = await queryDirectlyTCP('invalid-port.test', '192.0.2.1', new Map(), 'A', {
+        tcpPort: 65536
+    });
+
+    assert.equal(udpResult.error, 'SEND_ERROR');
+    assert.equal(udpResult.retryable, false);
+    assert.match(udpResult.detail, /udpPort/);
+    assert.equal(tcpResult.error, 'SEND_ERROR');
+    assert.equal(tcpResult.retryable, false);
+    assert.match(tcpResult.detail, /tcpPort/);
 });
 
 test('TCP query finishes after receiving a complete message without waiting for close', async () => {
@@ -540,15 +621,23 @@ test('resolveRecordFromRoot does not retry another server after cancellation', a
     assert.equal(queryCount, 1);
 });
 
-test('timeout cache entries are separated by timeoutMs', async () => {
+test('cache entries are separated by timeoutMs and destination ports', async () => {
     const restoreUdp = mockUdp(() => {});
 
     try {
         const cache = new Map();
         await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', { timeoutMs: 1 });
         await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', { timeoutMs: 2 });
+        await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', {
+            timeoutMs: 1,
+            udpPort: 5353
+        });
+        await queryDirectlyUDP('timeout-options.test', '192.0.2.1', cache, 'A', {
+            timeoutMs: 1,
+            tcpPort: 5353
+        });
 
-        assert.equal(cache.size, 2);
+        assert.equal(cache.size, 4);
     } finally {
         restoreUdp();
     }

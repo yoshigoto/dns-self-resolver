@@ -24,7 +24,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 提供する機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID は暗号論的乱数 (`crypto.randomInt`) で生成する。transaction ID が一致しない応答、question が存在して問い合わせ内容と一致しない応答、(UDP の場合) 送信元アドレス・ポート (53) が一致しない応答は無視して正規の応答を待ち続ける。question が省略された応答は、transaction ID が一致する FORMERR 応答のみ受け入れる。`timeoutMs` と `AbortSignal` を指定可能 (偽装応答への対策の詳細は「[セキュリティ対策](#セキュリティ対策)」を参照)
+- `queryDirectlyUDP` / `queryDirectlyTCP`: EDNS0・FORMERR 再試行・TC=1 時の TCP フォールバックに対応した DNS クエリ送受信。transaction ID は暗号論的乱数 (`crypto.randomInt`) で生成する。transaction ID が一致しない応答、question が存在して問い合わせ内容と一致しない応答、(UDP の場合) 送信元アドレス・ポートが問い合わせ先と一致しない応答は無視して正規の応答を待ち続ける。question が省略された応答は、transaction ID が一致する FORMERR 応答のみ受け入れる。`udpPort` / `tcpPort`、`timeoutMs` と `AbortSignal` を指定可能 (ポートの既定値は 53。偽装応答への対策の詳細は「[セキュリティ対策](#セキュリティ対策)」を参照)
 - `resolveRecordFromServer`: 指定した権威サーバーから特定レコード (A / AAAA 等) を直接取得するヘルパー
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self` / `resolveRecordFromRoot`: ルートサーバーから NS 名の IP アドレスを再帰的に自己解決 (同一ホスト名の並行解決 Promise 共有・循環参照検出・CNAME 追跡・ルートサーバー切り替え・`knownAddresses` や共有キャッシュ対応)
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を A / AAAA の指定型で解決。後者は IPv4 優先時に AAAA へフォールバックするため、既存の `resolveDnsServerAddress` 呼び出しを置き換えやすい
@@ -63,15 +63,17 @@ const cache = new Map();
 const res = await queryDirectlyUDP('example.com', '198.41.0.4', cache, 'NS');
 
 const dnssecRes = await queryDirectlyUDP('com', '198.41.0.4', cache, 'DS', {
-	useEdns: true,
-	dnssecOk: true,
-	udpPayloadSize: 1232,
+  useEdns: true,
+  dnssecOk: true,
+  udpPayloadSize: 1232,
+  udpPort: 5353,
+  tcpPort: 5353,
   timeoutMs: 5000,
   signal: AbortSignal.timeout(30000)
 });
 ```
 
-`queryDirectlyTCP` の第5引数にも同じオプションオブジェクトを指定できます。`queryDirectlyUDP` の従来の第5引数 (`useEdns` の boolean) も引き続き利用できます。UDP応答の `TC` フラグによるTCPフォールバックではオプションが維持され、キャッシュはEDNSとDNSSEC OK (DO) の有無ごとに分離されます。
+`queryOptions.udpPort` と `queryOptions.tcpPort` でそれぞれ問い合わせ先の UDP/TCP ポートを指定できます (1〜65535 の整数)。UDP 応答の送信元ポートも指定した UDP ポートと照合します。`queryDirectlyTCP` の第5引数にも同じオプションオブジェクトを指定でき、UDP 応答の `TC` フラグによる TCP フォールバックでも `tcpPort` を含むオプションが維持されます。ポート設定が異なる問い合わせはキャッシュ上も分離されます。`queryDirectlyUDP` の従来の第5引数 (`useEdns` の boolean) も引き続き利用できます。キャッシュは EDNS と DNSSEC OK (DO) の有無ごとにも分離されます。
 
 ルートからの探索では、問い合わせ1回ごとの制限を `queryOptions.timeoutMs`、探索全体の制限を `signal` で指定します。`signal` が中断されると進行中のUDP/TCPソケットを閉じ、後続サーバーへの再試行も停止します。
 
@@ -96,7 +98,7 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 - 応答待ちの同一 UDP 問い合わせ (サーバー・名前・タイプ・オプションが同じもの) は 1 本にまとめ、結果を全呼び出し元で共有する。同じ問い合わせを並行して複数送ると偽装応答がいずれかに一致する確率が送信数に比例して上がる誕生日攻撃 (CERT VU#457875) への対策。呼び出し元ごとの `AbortSignal` はその呼び出し元だけを中断し、実際の問い合わせは待っている呼び出し元が全員中断した時点で中断する。異なる応答キャッシュを渡した呼び出し元にも結果のキャッシュを反映する
 - UDP のソースポートを `crypto.randomInt` で 1024〜65535 から選んでバインド (OS のエフェメラルポート範囲に依存しない。使用中の場合は数回選び直し、最終的に OS 割り当てへフォールバック)
 - DNS 0x20: UDP の question 名の英字の大文字小文字をランダム化し、応答の question 名の完全一致を要求する。結果のレコード名は呼び出し側が指定した表記に戻して返す。`queryOptions.use0x20: false` で無効化できる。transaction ID と質問内容が一致し大文字小文字だけが異なる応答しか届かなかった場合 (大文字小文字を保持しないサーバー) は、タイムアウト後に 0x20 なしで 1 回だけ再試行し、結果に `caseRandomizationFallback: true` を付与する
-- 送信元アドレス・ポート、ヘッダの transaction ID と QR ビットを**デコード前に**検証する。不正なデータグラムを偽装して送り付けても問い合わせは打ち切られない
+- 送信元アドレス・ポート (既定 53、`udpPort` で変更可能)、ヘッダの transaction ID と QR ビットを**デコード前に**検証する。不正なデータグラムを偽装して送り付けても問い合わせは打ち切られない
 - 応答キャッシュには問い合わせ名と完全に一致する応答のみを保存し、referral の glue は保存しない
 - `gluePolicy: 'strict'` (既定) では out-of-bailiwick な glue を利用しない
 - referral は「問い合わせ中のサーバーゾーンの真の子孫」かつ「問い合わせ名の祖先」である場合のみ受け入れる。上向き・横向きの referral は lame として扱い、次の候補サーバーへ切り替える
