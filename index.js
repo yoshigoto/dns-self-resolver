@@ -793,14 +793,16 @@ function getIdentity(value) {
 
 function getCacheScope(dependencies) {
     if (typeof dependencies === 'string') return dependencies;
-    if (!dependencies) return 'default';
+    if (!dependencies) return `default|udp:${DNS_PORT},tcp:${DNS_PORT}`;
+    const queryOptions = dependencies.queryOptions || {};
+    const portScope = `udp:${queryOptions.udpPort ?? DNS_PORT},tcp:${queryOptions.tcpPort ?? DNS_PORT}`;
     const parts = [
         dependencies.knownAddresses,
         dependencies.queryDirectlyUDP,
         dependencies.resolveHostnameIPv4Self,
         dependencies.resolveHostnameIPv6Self
     ].map(getIdentity);
-    return parts.every(part => part === '-') ? 'default' : `scope:${parts.join(',')}`;
+    return `${parts.every(part => part === '-') ? 'default' : `scope:${parts.join(',')}`}|${portScope}`;
 }
 
 function getNameserverResolutionKey(hostname, gluePolicy = 'strict', scope = 'default') {
@@ -850,7 +852,7 @@ function getUnexpiredEntry(map, key) {
     return entry;
 }
 
-export function getCachedNameserverIPs(hostname, gluePolicy = 'strict', dependencies = 'default') {
+export function getCachedNameserverIPs(hostname, gluePolicy = 'strict', dependencies = {}) {
     const key = getNameserverResolutionKey(hostname, gluePolicy, getCacheScope(dependencies));
     return getUnexpiredEntry(nameserverIpCache, key)?.ips || null;
 }
@@ -860,7 +862,7 @@ export function cacheNameserverIPs(
     ips,
     ttlMs = NAMESERVER_IP_CACHE_TTL,
     gluePolicy = 'strict',
-    dependencies = 'default'
+    dependencies = {}
 ) {
     if (!hostname || !Array.isArray(ips)) return;
     const validIps = ips.filter(isIpLiteral);

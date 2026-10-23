@@ -357,7 +357,12 @@ test('UDP queries use the configured port and only accept responses from that po
     const restoreUdp = mockUdp((query, socket, host, port) => {
         sentToPort = port;
         queueMicrotask(() => {
-            socket.emit('message', createDnsResponse(query), { address: host, port: 53 });
+            socket.emit('message', dnsPacket.encode({
+                type: 'response',
+                id: query.id,
+                questions: query.questions,
+                answers: [{ name: query.questions[0].name, type: 'NS', data: 'wrong-port.test' }]
+            }), { address: host, port: 53 });
             socket.emit('message', createDnsResponse(query), { address: host, port });
         });
     });
@@ -953,6 +958,46 @@ test('nameserver resolution cache is separated by glue policy', async () => {
     assert.equal(queryCount, 8);
 });
 
+test('nameserver resolution cache and in-flight queries are separated by DNS ports', async () => {
+    const queries = [];
+    const queryDirectlyUDP = async (domain, serverIp, cache, qType, options) => {
+        queries.push({ domain, port: options.udpPort });
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return {
+            flags: 1024,
+            answers: [{
+                name: domain,
+                type: qType,
+                data: qType === 'A'
+                    ? (options.udpPort === 5301 ? '192.0.2.61' : '192.0.2.62')
+                    : (options.udpPort === 5301 ? '2001:db8::61' : '2001:db8::62')
+            }]
+        };
+    };
+    const hostname = 'port-isolated-ns.example.test';
+    const portOptions = port => ({ queryDirectlyUDP, queryOptions: { udpPort: port } });
+
+    const [firstPort, secondPort] = await Promise.all([
+        resolveServerIPs(hostname, portOptions(5301)),
+        resolveServerIPs(hostname, portOptions(5302))
+    ]);
+
+    assert.deepEqual(firstPort, ['192.0.2.61', '2001:db8::61']);
+    assert.deepEqual(secondPort, ['192.0.2.62', '2001:db8::62']);
+    assert.equal(queries.length, 4);
+    assert.deepEqual(new Set(queries.map(query => query.port)), new Set([5301, 5302]));
+
+    assert.deepEqual(await resolveServerIPs(hostname, portOptions(5301)), firstPort);
+    assert.deepEqual(await resolveServerIPs(hostname, portOptions(5302)), secondPort);
+    assert.equal(queries.length, 4, 'each port-specific result should be reused only within its own scope');
+
+    await resolveServerIPs(hostname, {
+        queryDirectlyUDP,
+        queryOptions: { udpPort: 5301, tcpPort: 5303 }
+    });
+    assert.equal(queries.length, 6, 'TCP port must also distinguish name-resolution cache entries');
+});
+
 for (const [label, resolveSelf, qType, answer] of [
     ['IPv4', resolveHostnameIPv4Self, 'A', '192.0.2.10'],
     ['IPv6', resolveHostnameIPv6Self, 'AAAA', '2001:db8::10']
@@ -1430,16 +1475,26 @@ test('UDP: only malformed responses result in DECODE_ERROR after the timeout', a
 });
 
 test('UDP: response from an unexpected source port is ignored', async () => {
-    const restoreUdp = mockUdp((query, socket) => {
-        queueMicrotask(() => {
-            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 5353 });
-            socket.emit('message', createDnsResponse(query), { address: '192.0.2.1', port: 53 });
-        });
+    const restoreUdp = mockUdp((query, socket, host, port) => {
+        const wrongPort = port === 53 ? 5353 : 53;
+        queueMicrotask(() => socket.emit(
+            'message',
+            createDnsResponse(query),
+            { address: host, port: wrongPort }
+        ));
     });
 
     try {
-        const result = await queryDirectlyUDP('spoofed-port.test', '192.0.2.1', new Map(), 'NS', { useEdns: false });
-        assert.equal(result.answers[0].data, 'a.gtld-servers.net');
+        for (const udpPort of [53, 5353]) {
+            const result = await queryDirectlyUDP(
+                `spoofed-port-${udpPort}.test`,
+                '192.0.2.1',
+                new Map(),
+                'NS',
+                { useEdns: false, udpPort, timeoutMs: 10 }
+            );
+            assert.equal(result.error, 'TIMEOUT');
+        }
     } finally {
         restoreUdp();
     }
