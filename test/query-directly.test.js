@@ -47,6 +47,68 @@ const FIXED_A_RESPONSE = Buffer.from(
     'c00c000100010000003c0004c000027b',
     'hex'
 );
+const FIXED_DNS_RESPONSES = [
+    {
+        domain: 'example.com',
+        qType: 'AAAA',
+        wire: '000081800001000100000000076578616d706c6503636f6d00001c0001' +
+            'c00c001c00010000003c001020010db8000000000000000000001234',
+        answer: { name: 'example.com', type: 'AAAA', ttl: 60, data: '2001:db8::1234' }
+    },
+    {
+        domain: 'www.example.com',
+        qType: 'CNAME',
+        wire: '00008180000100010000000003777777076578616d706c6503636f6d0000050001' +
+            'c00c000500010000003c0002c010',
+        answer: { name: 'www.example.com', type: 'CNAME', ttl: 60, data: 'example.com' }
+    },
+    {
+        domain: 'example.com',
+        qType: 'NS',
+        wire: '000081800001000100000000076578616d706c6503636f6d0000020001' +
+            'c00c000200010000003c0006036e7331c00c',
+        answer: { name: 'example.com', type: 'NS', ttl: 60, data: 'ns1.example.com' }
+    },
+    {
+        domain: 'com',
+        qType: 'DS',
+        wire: '00008180000100020000000103636f6d00002b0001' +
+            'c00c002b00010000003c002413370802' +
+            '1111111111111111111111111111111111111111111111111111111111111111' +
+            'c00c002e00010000003c0017002b08010000003c77359400713fb300303900deadbeef' +
+            '00002904d0000080000000',
+        answers: [
+            {
+                name: 'com',
+                type: 'DS',
+                ttl: 60,
+                data: {
+                    keyTag: 4919,
+                    algorithm: 8,
+                    digestType: 2,
+                    digest: Buffer.alloc(32, 0x11)
+                }
+            },
+            {
+                name: 'com',
+                type: 'RRSIG',
+                ttl: 60,
+                data: {
+                    typeCovered: 'DS',
+                    algorithm: 8,
+                    labels: 1,
+                    originalTTL: 60,
+                    expiration: 2000000000,
+                    inception: 1900000000,
+                    keyTag: 12345,
+                    signersName: '.',
+                    signature: Buffer.from('deadbeef', 'hex')
+                }
+            }
+        ],
+        additional: { type: 'OPT', name: '.', udpPayloadSize: 1232, flags: 0x8000 }
+    }
+];
 
 function createDnssecDsResponse(query) {
     return dnsPacket.encode({
@@ -191,6 +253,90 @@ test('queryDirectlyUDP decodes a fixed DNS wire response', async () => {
         ]);
     } finally {
         dgram.createSocket = originalCreateSocket;
+    }
+});
+
+test('queryDirectlyUDP decodes fixed compressed and DNSSEC wire records', async t => {
+    const originalCreateSocket = dgram.createSocket;
+    let fixtureIndex = 0;
+    dgram.createSocket = () => {
+        const socket = new EventEmitter();
+        socket.close = () => {};
+        socket.bind = (options, callback) => queueMicrotask(callback);
+        socket.send = (buffer, offset, length, port, host, callback) => {
+            callback?.(null);
+            const fixture = FIXED_DNS_RESPONSES[fixtureIndex++];
+            assert.ok(fixture, 'unexpected extra DNS query');
+            const response = Buffer.from(fixture.wire, 'hex');
+            response.writeUInt16BE(buffer.readUInt16BE(0), 0);
+            queueMicrotask(() => socket.emit('message', response, { address: host, port }));
+        };
+        return socket;
+    };
+
+    try {
+        for (const fixture of FIXED_DNS_RESPONSES) {
+            await t.test(`${fixture.qType} ${fixture.domain}`, async () => {
+                const result = await queryDirectlyUDP(
+                    fixture.domain,
+                    '192.0.2.1',
+                    new Map(),
+                    fixture.qType,
+                    { useEdns: fixture.qType === 'DS', dnssecOk: fixture.qType === 'DS', use0x20: false }
+                );
+
+                assert.equal(result.error, undefined);
+                const answers = result.answers.map(({ name, type, ttl, data }) =>
+                    ({ name, type, ttl, data }));
+                assert.deepEqual(answers, fixture.answers || [fixture.answer]);
+                if (fixture.additional) {
+                    assert.deepEqual(result.additionals.map(({ type, name, udpPayloadSize, flags }) =>
+                        ({ type, name, udpPayloadSize, flags })), [fixture.additional]);
+                }
+            });
+        }
+    } finally {
+        dgram.createSocket = originalCreateSocket;
+    }
+});
+
+test('queryDirectlyTCP encodes EDNS/DO and decodes a fixed length-prefixed DNSSEC response', async () => {
+    const originalCreateConnection = net.createConnection;
+    net.createConnection = (options, onConnect) => {
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        socket.write = buffer => {
+            const expectedQuery = Buffer.from(
+                '002000000000000100000000000103636f6d00002b000100002904d0000080000000',
+                'hex'
+            );
+            expectedQuery.writeUInt16BE(buffer.readUInt16BE(2), 2);
+            assert.deepEqual(buffer, expectedQuery);
+
+            const response = Buffer.from(FIXED_DNS_RESPONSES.find(({ qType }) => qType === 'DS').wire, 'hex');
+            response.writeUInt16BE(buffer.readUInt16BE(2), 0);
+            const framedResponse = Buffer.alloc(response.length + 2);
+            framedResponse.writeUInt16BE(response.length, 0);
+            response.copy(framedResponse, 2);
+            queueMicrotask(() => socket.emit('data', framedResponse));
+        };
+        queueMicrotask(onConnect);
+        return socket;
+    };
+
+    try {
+        const result = await queryDirectlyTCP('com', '192.0.2.1', new Map(), 'DS', {
+            useEdns: true,
+            dnssecOk: true,
+            udpPayloadSize: 1232
+        });
+
+        assert.equal(result.error, undefined);
+        assert.equal(result.transport, 'tcp');
+        assert.deepEqual(result.answers.map(record => record.type), ['DS', 'RRSIG']);
+        assert.equal(result.additionals[0].flags, 0x8000);
+    } finally {
+        net.createConnection = originalCreateConnection;
     }
 });
 
