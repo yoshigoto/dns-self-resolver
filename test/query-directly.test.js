@@ -1418,6 +1418,33 @@ test('failed nameserver resolution is negatively cached for a short time', async
     assert.equal(queryCount, 1);
 });
 
+test('negative nameserver cache is separated by DNS ports', async () => {
+    const hostname = 'port-negative-cache.example.test';
+    const queries = [];
+    const queryUDP = async (domain, serverIp, cache, qType, options) => {
+        queries.push({ domain, port: options.udpPort });
+        if (options.udpPort === 5401) {
+            return { flags: 1024, rcode: 'NXDOMAIN', answers: [] };
+        }
+        return {
+            flags: dnsPacket.AUTHORITATIVE_ANSWER,
+            answers: [{ name: domain, type: qType, data: '192.0.2.91' }]
+        };
+    };
+    const dependenciesForPort = udpPort => ({
+        queryDirectlyUDP: queryUDP,
+        queryOptions: { udpPort }
+    });
+
+    assert.equal(await resolveHostnameIPv4Self(hostname, dependenciesForPort(5401)), null);
+    assert.equal(await resolveHostnameIPv4Self(hostname, dependenciesForPort(5401)), null);
+    assert.equal(queries.length, 1, 'failure should be negatively cached for the same port');
+
+    assert.equal(await resolveHostnameIPv4Self(hostname, dependenciesForPort(5402)), '192.0.2.91');
+    assert.equal(queries.length, 2, 'failure on one port must not block resolution on another port');
+    assert.deepEqual(queries.map(query => query.port), [5401, 5402]);
+});
+
 test('nested NS resolution reuses the caller response cache', async () => {
     const cache = new Map();
     const seenCaches = new Set();
