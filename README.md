@@ -110,7 +110,7 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 
 `error` には `TIMEOUT`、`ABORTED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。
 
-UDP では、不正なデータグラムを受け取っても問い合わせを打ち切らず、正しい応答を待ちます。不正な応答しか届かずタイムアウトした場合は `DECODE_ERROR` を返します。UDP から TCP へのフォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。このエラー形式には `retryFrom: 'udp-truncated'` と `isFallback: true` が含まれます。
+UDP では、不正なデータグラムを受け取っても問い合わせを打ち切らず、正しい応答を待ちます。送信元・トランザクション ID・QR ビットの検証を通過した応答でデコードに失敗し、その後も正しい応答が届かずタイムアウトした場合は `DECODE_ERROR` を返します（大文字・小文字の不一致による 0x20 なし再試行の条件も満たす場合は、再試行を優先します）。送信元や ID が一致しない応答だけを受け取った場合は `TIMEOUT` を返します。UDP から TCP へのフォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。このエラー形式には `retryFrom: 'udp-truncated'` と `isFallback: true` が含まれます。
 
 ## キャッシュ
 
