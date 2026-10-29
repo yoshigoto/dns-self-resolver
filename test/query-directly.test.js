@@ -372,7 +372,8 @@ test('in-domain glue だけを採用する', () => {
 test('glue 判定では NS 名リストの大文字と末尾ドットを正規化する', () => {
     const additionals = [
         { type: 'A', name: 'NS1.Child.Example.COM.', data: '192.0.2.53' },
-        { type: 'AAAA', name: 'ns1.child.example.com', data: '2001:db8::53' }
+        { type: 'AAAA', name: 'ns1.child.example.com', data: '2001:db8::53' },
+        { type: 'A', name: 'ns2.child.example.com', data: '192.0.2.54' }
     ];
 
     assert.equal(
@@ -385,7 +386,7 @@ test('glue 判定では NS 名リストの大文字と末尾ドットを正規�
             ['NS1.Child.Example.COM.'],
             'CHILD.EXAMPLE.COM.'
         ),
-        additionals
+        additionals.slice(0, 2)
     );
 });
 
@@ -711,6 +712,50 @@ test('UDP and TCP share successful response cache entries', async () => {
     } finally {
         restoreUdp();
         net.createConnection = originalCreateConnection;
+    }
+});
+
+test('UDP success cache uses the minimum answer/authority TTL and falls back when empty', async () => {
+    const restoreUdp = mockUdp((query, socket) => {
+        const name = query.questions[0].name;
+        const ttl = name.startsWith('authority-ttl')
+            ? {
+                answers: [{ name, type: 'A', ttl: 60, data: '192.0.2.1' }],
+                authorities: [{ name: 'example.test', type: 'NS', ttl: 7, data: 'ns.example.test' }]
+            }
+            : name.startsWith('zero-ttl')
+                ? { answers: [{ name, type: 'A', ttl: 0, data: '192.0.2.2' }] }
+                : { answers: [], authorities: [] };
+        queueMicrotask(() => socket.emit('message', dnsPacket.encode({
+            type: 'response',
+            id: query.id,
+            questions: query.questions,
+            ...ttl
+        })));
+    });
+
+    try {
+        for (const [name, expectedTtlMs] of [
+            ['authority-ttl.example.test', 7000],
+            ['zero-ttl.example.test', 0],
+            ['empty-response.example.test', 30000]
+        ]) {
+            const cache = new Map();
+            await queryDirectlyUDP(name, '192.0.2.1', cache, 'A', { use0x20: false });
+            const entry = cache.values().next().value;
+            const remainingTtlMs = entry.expiresAt - Date.now();
+
+            if (expectedTtlMs === 0) {
+                assert.ok(remainingTtlMs <= 0, `${name} must not be cached past TTL 0`);
+            } else {
+                assert.ok(
+                    remainingTtlMs <= expectedTtlMs && remainingTtlMs > expectedTtlMs - 1000,
+                    `${name} expected about ${expectedTtlMs}ms, got ${remainingTtlMs}ms`
+                );
+            }
+        }
+    } finally {
+        restoreUdp();
     }
 });
 
@@ -1448,6 +1493,51 @@ test('NXNS: glueless NS names resolved per referral are capped', async () => {
 
     assert.deepEqual(result, []);
     assert.equal(resolvedHosts.length, RESOLUTION_LIMITS.maxGluelessNsPerReferral);
+});
+
+test('NXNS: referral address candidates are capped without discarding glueless fallback candidates', async () => {
+    const addresses = [];
+    const resolvedHosts = [];
+    const resolutionLimits = {
+        maxCandidatesPerReferral: 4,
+        maxGluelessNsPerReferral: 2
+    };
+    const addressedCount = resolutionLimits.maxCandidatesPerReferral + 5;
+    const gluelessCount = resolutionLimits.maxGluelessNsPerReferral + 5;
+    const nsRecords = Array.from({ length: addressedCount + gluelessCount }, (_, index) =>
+        ({ name: 'candidate-limit.test', type: 'NS', data: `ns${index}.candidate-limit.test` }));
+    const additionals = Array.from({ length: addressedCount }, (_, index) => ({
+        name: `ns${index}.candidate-limit.test`,
+        type: 'A',
+        data: `192.0.2.${index + 1}`
+    }));
+
+    const result = await resolveRecordFromRoot('www.candidate-limit.test', 'A', new Map(), {
+        queryDirectlyUDP: async (domain, serverIp) => {
+            if (serverIp === ROOT_SERVER_BOOTSTRAP_IP) {
+                return { authorities: nsRecords, additionals };
+            }
+            addresses.push(serverIp);
+            return { error: 'SOCKET_ERROR' };
+        },
+        resolveHostnameIPv4Self: async hostname => {
+            resolvedHosts.push(hostname);
+            return null;
+        },
+        resolveHostnameIPv6Self: async () => null,
+        resolutionLimits
+    });
+
+    assert.deepEqual(result, []);
+    assert.deepEqual(
+        addresses,
+        additionals.slice(0, resolutionLimits.maxCandidatesPerReferral).map(record => record.data)
+    );
+    assert.deepEqual(
+        resolvedHosts,
+        nsRecords.slice(addressedCount, addressedCount + resolutionLimits.maxGluelessNsPerReferral)
+            .map(record => record.data)
+    );
 });
 
 test('NXNS: nested glueless resolutions share a bounded query budget', async () => {
