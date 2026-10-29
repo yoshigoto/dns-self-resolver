@@ -55,8 +55,8 @@ export function getReferralAddressRecords(
     if (gluePolicy === 'strict') {
         const isRootReferral = serverZone === '.';
         return additionals.filter(record =>
-            isInBailiwickGlue(record, nsNames, delegatedZone) ||
-            (isRootReferral && isNsAddressRecord(record)));
+            isNsAddressRecord(record) &&
+            (isRootReferral || isSubdomainOrEqual(record.name, delegatedZone)));
     }
     if (gluePolicy !== 'allow-sibling') {
         throw new Error(`未対応の gluePolicy です: ${gluePolicy}`);
@@ -76,12 +76,17 @@ export const DNS_CACHE_TTL = {
 
 // レコード TTL (秒) と上限 (ms) の小さい方をキャッシュ期間として採用する
 function computeSuccessTtlMs(decoded, capMs = DNS_CACHE_TTL.success) {
-    const records = [...(decoded?.answers || []), ...(decoded?.authorities || [])];
-    const ttlSeconds = records
-        .map(record => record.ttl)
-        .filter(ttl => typeof ttl === 'number' && ttl >= 0);
-    if (ttlSeconds.length === 0) return capMs;
-    return Math.min(Math.min(...ttlSeconds) * 1000, capMs);
+    let minTtlSeconds = Infinity;
+    for (const section of [decoded?.answers, decoded?.authorities]) {
+        for (const record of section || []) {
+            if (typeof record.ttl === 'number' && record.ttl >= 0) {
+                minTtlSeconds = Math.min(minTtlSeconds, record.ttl);
+            }
+        }
+    }
+    return minTtlSeconds === Infinity
+        ? capMs
+        : Math.min(minTtlSeconds * 1000, capMs);
 }
 
 function buildDnsError(code, { domain, serverIp, qType, transport, detail, retryable }) {
@@ -1088,20 +1093,28 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         // 参照アドレスを持つ候補を優先し、無い候補は捨てずにフォールバック用に保持する。
         // knownAddresses が指定されていれば referral アドレスがない候補の事前解決アドレスとしても参照する。
         // NXNS 型の増幅を防ぐため、試行する候補数 (特に glue なしで自己解決する NS 名) には上限を設ける。
-        const candidates = nsNames.flatMap(nsName => {
+        const addressedCandidates = [];
+        const gluelessCandidates = [];
+        for (const nsName of nsNames) {
             const referralAddresses = referralAddressByNsName.get(nsName) || [];
             const knownAddresses = dependencies.knownAddresses
                 ? getKnownAddress(dependencies.knownAddresses, nsName)
                 : [];
-            const addresses = [...new Set([...referralAddresses, ...(knownAddresses || [])])];
-            return addresses.length > 0
-                ? addresses.map(ip => ({ nsName, ip, zone: delegatedZone }))
-                : [{ nsName, ip: null, zone: delegatedZone }];
-        });
-        candidateQueue = [
-            ...candidates.filter(c => c.ip).slice(0, limits.maxCandidatesPerReferral),
-            ...candidates.filter(c => !c.ip).slice(0, limits.maxGluelessNsPerReferral)
-        ];
+            const addresses = new Set([...referralAddresses, ...(knownAddresses || [])]);
+            if (addresses.size > 0) {
+                for (const ip of addresses) {
+                    if (addressedCandidates.length >= limits.maxCandidatesPerReferral) break;
+                    addressedCandidates.push({ nsName, ip, zone: delegatedZone });
+                }
+            } else if (gluelessCandidates.length < limits.maxGluelessNsPerReferral) {
+                gluelessCandidates.push({ nsName, ip: null, zone: delegatedZone });
+            }
+            if (addressedCandidates.length >= limits.maxCandidatesPerReferral &&
+                gluelessCandidates.length >= limits.maxGluelessNsPerReferral) {
+                break;
+            }
+        }
+        candidateQueue = [...addressedCandidates, ...gluelessCandidates];
 
         // グルーが無い NS 名は再帰的に自己解決する (循環参照は resolveHostnameIPv4Self 側で検出)
         if (await useNextCandidate()) continue;
