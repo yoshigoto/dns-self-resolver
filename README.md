@@ -24,6 +24,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 - `getReferralAddressRecords` / `isInBailiwickGlue` など: 委任応答から利用可能な glue を判定します。
 - `classifyReferralAddressRecords`: NS 名に対応する ADDITIONAL の A/AAAA を `in-domain`、`sibling`、`unrelated` に分類します。解決候補への採用とは独立した処理です。
 - `isPublicDnsServerAddress`: 公開権威 DNS 向けの問い合わせ先アドレスを判定します。
+- `createQueryBudget`: 再送・TCP フォールバックを含む送信回数の共有予算を作ります。
 
 ## 使い方
 
@@ -106,8 +107,35 @@ const candidates = getReferralAddressRecords(
 | `signal` | なし | 問い合わせまたは解決処理を中断する `AbortSignal` です。 |
 | `use0x20` | `true` | UDP の質問名の大文字・小文字をランダム化します。 |
 | `isAllowedServerIP` | なし | 問い合わせ先 IP アドレスを受け取り、許可する場合に `true` を返す同期関数です。 |
+| `queryBudget` | なし | `createQueryBudget(maxQueries)` で作った、DNS メッセージ送信回数の共有予算です。 |
 
 `queryDirectlyUDP` と `queryDirectlyTCP` は、指定された DNS サーバーが IPv4 または IPv6 のアドレスリテラルであることを要求します。ホスト名を渡す場合は、先に `resolveDnsServerAddress` などで IP アドレスへ解決してください。
+
+### 送信回数の共有予算
+
+```js
+import { createQueryBudget, queryDirectlyUDP, resolveServerIPs } from 'dns-self-resolver';
+
+const queryBudget = createQueryBudget(1000);
+const cache = new Map();
+const controller = new AbortController();
+const dependencies = { queryBudget, signal: controller.signal, dnsResponseCache: cache };
+const addresses = await resolveServerIPs('ns.example.com', dependencies);
+if (!addresses?.length) throw new Error('NS address resolution failed');
+const response = await queryDirectlyUDP('example.com', addresses[0], cache, 'NS', {
+  queryBudget, signal: controller.signal
+});
+```
+
+同じ検査のすべての問い合わせに同じ予算オブジェクトを渡してください。直接問い合わせと `resolveRecordFromServer` では第 5 引数、ルート・NS 自己解決では `dependencies.queryBudget`（または `dependencies.queryOptions.queryBudget`）に指定します。両方ある場合は前者を優先します。入れ子の NS 解決、EDNS / 0x20 再試行、TCP フォールバックにも引き継ぎます。差し替えた問い合わせ関数は、受け取った `queryBudget` と `signal` を実トランスポートへ渡す必要があります。
+
+UDP の `send` / TCP の DNS メッセージ `write` の直前に `remaining` を 1 減らします。UDP と TCP の取得はそれぞれ 1 回、A と AAAA も別々に数えます。送信処理に渡した後の失敗では予算を戻しません。バイト数、TCP 接続のハンドシェイク、OS による TCP 再送の回数は数えません。キャッシュ利用、送信前のキャンセル・宛先拒否・入力不備では減らしません。
+
+同じ予算の並行 UDP 問い合わせは合流して 1 送信として数えます。異なる予算間では問い合わせと NS 自己解決の合流を分離し、片方の検査がもう片方の予算を消費しないようにします。完了した応答キャッシュは予算が異なっていても再利用できます。
+
+残り 0 で新たな送信が必要になると、送信せず `QUERY_LIMIT_EXCEEDED`（`retryable: false`）を返し、`exhausted` を `true` にします。このエラーはキャッシュしません。最後の許可された送信を行っただけでは `exhausted` は立たず、残り 0 でもキャッシュは利用できます。自己解決の戻り値規約は変わりませんが、予算で打ち切られた結果を NS のネガティブキャッシュや完全なアドレス一覧として保存しません。アプリは `queryBudget.exhausted` を確認し、結果が不完全であることを表示してください。
+
+省略時は送信予算を強制しません。`maxQueries` は 0 以上の安全な整数で、不正な値は `TypeError` になります。時間制限・クライアント切断時のキャンセルは、アプリが作った `AbortSignal` を併用してください。
 
 ### 問い合わせ先のポリシー
 
@@ -149,7 +177,7 @@ const addresses = await resolveServerIPs('ns.example.com', {
 }
 ```
 
-`error` には `TIMEOUT`、`ABORTED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。
+`error` には `TIMEOUT`、`ABORTED`、`QUERY_LIMIT_EXCEEDED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。
 
 UDP では、不正なデータグラムを受け取っても問い合わせを打ち切らず、正しい応答を待ちます。送信元・トランザクション ID・QR ビットの検証を通過した応答でデコードに失敗し、その後も正しい応答が届かずタイムアウトした場合は `DECODE_ERROR` を返します（大文字・小文字の不一致による 0x20 なし再試行の条件も満たす場合は、再試行を優先します）。送信元や ID が一致しない応答だけを受け取った場合は `TIMEOUT` を返します。UDP から TCP へのフォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。このエラー形式には `retryFrom: 'udp-truncated'` と `isFallback: true` が含まれます。
 
@@ -172,7 +200,7 @@ NXNS 型の増幅や過剰なリソース消費を抑える上限があります
 
 | 項目 | 既定値 | 説明 |
 |---|---:|---|
-| `maxQueriesPerResolution` | 100 | 入れ子のネームサーバー解決を含む、1 回の解決で送信する問い合わせ数。 |
+| `maxQueriesPerResolution` | 100 | 入れ子のネームサーバー解決を含む、1 回の解決での問い合わせ関数呼び出し数。キャッシュ利用も数え、内部再送は別途数えません。 |
 | `maxGluelessNsPerReferral` | 5 | 1 つの referral で自己解決を試す、glue のない NS 名の数。 |
 | `maxCandidatesPerReferral` | 20 | 1 つの referral で試す、アドレス付き候補の数。 |
 | `maxNsResolutionDepth` | 5 | glue のない NS 名を入れ子で解決する深さ。 |
@@ -182,6 +210,8 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
   resolutionLimits: { maxQueriesPerResolution: 50 }
 });
 ```
+
+この既存の探索量制限は維持しています。実際の送信回数を制限する `queryBudget` とは別の上限です。
 
 問い合わせ応答キャッシュとネームサーバー IP キャッシュには、それぞれエントリ数の上限（既定 10,000 件）があり、上限を超えると古いエントリから削除します。TCP 応答の受信量にも上限があります。
 

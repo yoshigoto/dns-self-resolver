@@ -200,7 +200,34 @@ function normalizeQueryOptions(options, defaults = {}) {
     if (typeof options === 'boolean') {
         return { ...defaults, useEdns: options };
     }
-    return { ...defaults, ...(options || {}) };
+    const normalized = { ...defaults, ...(options || {}) };
+    if (normalized.queryBudget !== undefined &&
+        (!normalized.queryBudget || !Number.isSafeInteger(normalized.queryBudget.remaining) ||
+            normalized.queryBudget.remaining < 0)) {
+        throw new TypeError('queryBudget.remaining must be a non-negative safe integer');
+    }
+    return normalized;
+}
+
+export function createQueryBudget(maxQueries) {
+    if (!Number.isSafeInteger(maxQueries) || maxQueries < 0) {
+        throw new TypeError('maxQueries must be a non-negative safe integer');
+    }
+    return { remaining: maxQueries, exhausted: false };
+}
+
+function getQueryLimitError(domain, serverIp, qType, transport, options, consume = false) {
+    const budget = options.queryBudget;
+    if (!budget) return null;
+    if (budget.remaining > 0) {
+        if (consume) budget.remaining--;
+        return null;
+    }
+    budget.exhausted = true;
+    return buildDnsError('QUERY_LIMIT_EXCEEDED', {
+        domain, serverIp, qType, transport, retryable: false,
+        detail: 'The shared DNS transmission budget has been exhausted'
+    });
 }
 
 function getDnsCacheKey(serverIp, qType, domain, options) {
@@ -401,6 +428,8 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
         if (cachedResult) {
             return resolve({ ...cachedResult, isCached: true });
         }
+        const queryLimit = getQueryLimitError(domain, serverIp, qType, 'tcp', options);
+        if (queryLimit) return resolve(queryLimit);
 
         let settled = false;
         let socket = null;
@@ -438,7 +467,10 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
             });
 
             socket = net.createConnection({ host: serverIp, port: options.tcpPort }, () => {
-                if (!settled) socket.write(tcpBuf);
+                if (settled) return;
+                const queryLimit = getQueryLimitError(domain, serverIp, qType, 'tcp', options, true);
+                if (queryLimit) return finish(queryLimit);
+                socket.write(tcpBuf);
             });
 
             timer = setTimeout(() => {
@@ -525,7 +557,7 @@ const UDP_QUERY_DEFAULTS = Object.freeze({
 const inFlightUdpQueries = new Map();
 
 function getUdpInFlightKey(cacheKey, options) {
-    return `${cacheKey}|udp:${options.udpPayloadSize}|0x20:${options.use0x20 ? 1 : 0}`;
+    return `${cacheKey}|udp:${options.udpPayloadSize}|0x20:${options.use0x20 ? 1 : 0}|budget:${getIdentity(options.queryBudget)}`;
 }
 
 export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = true) {
@@ -627,6 +659,8 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
         if (cachedResult) {
             return resolve({ ...cachedResult, isCached: true });
         }
+        const queryLimit = getQueryLimitError(domain, serverIp, qType, 'udp', options);
+        if (queryLimit) return resolve(queryLimit);
 
         const socketType = isIPv6(serverIp) ? 'udp6' : 'udp4';
         let client = null;
@@ -804,6 +838,8 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 });
                 client.on('message', onMessage);
 
+                const queryLimit = getQueryLimitError(domain, serverIp, qType, 'udp', options, true);
+                if (queryLimit) return finish(queryLimit);
                 client.send(buf, 0, buf.length, options.udpPort, serverIp, (err) => {
                     if (err) {
                         const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
@@ -844,7 +880,7 @@ export const NAMESERVER_CACHE_MAX_ENTRIES = 10000;
 
 // NXNS 攻撃 (CVE-2020-12667 等) 型の増幅やリソース枯渇を防ぐための既定上限
 export const RESOLUTION_LIMITS = Object.freeze({
-    // 1 回のトップレベル解決 (入れ子の NS 名解決を含む) で送信する問い合わせ数の上限
+    // 1 回のトップレベル解決 (入れ子の NS 名解決を含む) の問い合わせ関数呼び出し数の上限
     maxQueriesPerResolution: 100,
     // 1 つの referral から glue なしで自己解決を試みる NS 名の上限
     maxGluelessNsPerReferral: 5,
@@ -910,7 +946,7 @@ function getResolutionBudget(dependencies = {}) {
     };
 }
 
-function consumeQueryBudget(budget) {
+function consumeResolutionBudget(budget) {
     if (budget.remaining <= 0) {
         budget.limitHits++;
         return false;
@@ -1055,6 +1091,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
     const queryOptions = {
         ...(dependencies.queryOptions || {}),
         ...(dependencies.isAllowedServerIP !== undefined ? { isAllowedServerIP: dependencies.isAllowedServerIP } : {}),
+        ...(dependencies.queryBudget !== undefined ? { queryBudget: dependencies.queryBudget } : {}),
         ...(dependencies.signal ? { signal: dependencies.signal } : {})
     };
     const limitHitsAtStart = budget.limitHits;
@@ -1117,7 +1154,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             if (await useNextCandidate()) continue;
             return done([]);
         }
-        if (!consumeQueryBudget(budget)) return done([]);
+        if (!consumeResolutionBudget(budget)) return done([]);
         depth++;
 
         let res = getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions);
@@ -1127,6 +1164,10 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             res = { error: 'QUERY_EXCEPTION', detail: e?.message };
         }
         if (res?.error === 'ABORTED') return done([]);
+        if (res?.error === 'QUERY_LIMIT_EXCEEDED') {
+            budget.limitHits++;
+            return done([]);
+        }
         if (!res || res.error) {
             if (await useNextCandidate()) continue;
             return done([]);
@@ -1297,8 +1338,9 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
     if (isNegativelyCached(normalized, gluePolicy, scope, family)) return null;
 
     const includeBlockedAddresses = family === 'ANY' && dependencies.includeBlockedAddresses === true;
-    const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}|includeBlocked:${includeBlockedAddresses ? 1 : 0}`;
-    const shareInFlight = !dependencies.signal;
+    const queryBudget = dependencies.queryBudget ?? dependencies.queryOptions?.queryBudget;
+    const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}|includeBlocked:${includeBlockedAddresses ? 1 : 0}|budget:${getIdentity(queryBudget)}`;
+    const shareInFlight = !dependencies.signal && !dependencies.queryOptions?.signal;
     if (shareInFlight && inFlightMap.has(resolutionKey)) {
         const shared = await inFlightMap.get(resolutionKey);
         // 合流先の失敗は別の解決経路の上限による打ち切りかもしれないため、呼び出し側でキャッシュさせない
@@ -1323,6 +1365,10 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
         const ips = recordsByType.flat();
         const allowedIps = filterAllowedAddresses(ips, dependencies);
         if (ips.length > 0) {
+            // 片方のアドレス種別が予算で打ち切られた結果を、完全な NS アドレス一覧として保存しない。
+            if (queryBudget?.exhausted) {
+                return includeBlockedAddresses ? ips : (allowedIps.length > 0 ? allowedIps : null);
+            }
             const ttls = results.map(result => result.ttlSeconds).filter(ttl => ttl !== null);
             const ttlMs = ttls.length > 0
                 ? Math.min(Math.min(...ttls) * 1000, NAMESERVER_IP_CACHE_TTL)
