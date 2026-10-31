@@ -22,6 +22,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 - `resolveRecordFromServer`: 指定した DNS サーバーからレコードを取得します。
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を指定したアドレス種別で解決します。後者は IPv4 を優先し、取得できない場合は IPv6 を試します。
 - `getReferralAddressRecords` / `isInBailiwickGlue` など: 委任応答から利用可能な glue を判定します。
+- `classifyReferralAddressRecords`: NS 名に対応する ADDITIONAL の A/AAAA を `in-domain`、`sibling`、`unrelated` に分類します。解決候補への採用とは独立した処理です。
 - `isPublicDnsServerAddress`: 公開権威 DNS 向けの問い合わせ先アドレスを判定します。
 
 ## 使い方
@@ -76,7 +77,21 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 `resolveRecordFromRoot` の `dependencies.gluePolicy` で glue の利用方針を指定できます。
 
 - `strict`（既定）: 委任先ゾーン内の glue を利用します。ルートから TLD への referral では、ルートが返す TLD ネームサーバーのアドレスも利用します。
+- `in-domain-only`: ルート referral も例外にせず、委任先ゾーン内の glue のみ利用します。親が保持する委任情報を調べる委任チェッカー向けの方針です。
 - `allow-sibling`: 問い合わせ中のサーバーゾーン配下にある sibling glue も利用します。RFC 9471 §2.3 の循環 sibling 委任が必要な場合に指定してください。
+
+`getReferralAddressRecords(additionals, nsNames, delegatedZone, gluePolicy, serverZone)` でも同じ方針を指定できます。既存の `strict` と `allow-sibling` の採用動作は変更していません。分類が同じでも、ポリシーに応じて採用するレコードは異なります。たとえばルートが返す TLD ゾーン外の NS アドレスは `sibling` に分類され、`strict` では採用し、`in-domain-only` では採用しません。
+
+```js
+import { classifyReferralAddressRecords, getReferralAddressRecords } from 'dns-self-resolver';
+
+const classified = classifyReferralAddressRecords(additionals, nsNames, delegatedZone, parentZone);
+const candidates = getReferralAddressRecords(
+  additionals, nsNames, delegatedZone, 'in-domain-only', parentZone
+);
+```
+
+分類結果は `{ inDomainGlueRecords, siblingGlueRecords, unrelatedAddressRecords }` です。NS 名に対応しないレコードや A/AAAA 以外はどの配列にも含めません。名前は大文字・小文字と末尾ドットを正規化して比較し、元のレコードと順序を維持します。DNS 応答は変更しません。親ゾーンには実際に応答したサーバーのゾーンを渡してください（ルートは `'.'` または `''`）。省略時のみ、従来の診断処理との互換性のため委任先名から左端のラベルを除いた名前を使います。この省略時の値は実際のゾーンカットを探索した結果ではありません。
 
 ## 問い合わせオプション
 
