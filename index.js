@@ -1064,15 +1064,20 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
     const useNextCandidate = async () => {
         while (candidateQueue.length > 0) {
             if (isAborted()) return false;
-            if (budget.remaining <= 0) {
+            const candidate = candidateQueue.shift();
+            if (!isIpLiteral(candidate.ip) && budget.remaining <= 0) {
                 budget.limitHits++;
                 return false;
             }
-            const candidate = candidateQueue.shift();
             const ip = isIpLiteral(candidate.ip)
                 ? candidate.ip
                 : (candidate.nsName ? await resolveNsAddress(candidate.nsName) : null);
             if (ip) {
+                if (filterAllowedAddresses([ip], dependencies).length === 0) continue;
+                if (budget.remaining <= 0) {
+                    budget.limitHits++;
+                    return false;
+                }
                 currentServerIp = ip;
                 currentServerZone = candidate.zone;
                 return true;
@@ -1081,9 +1086,15 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         return false;
     };
 
-    for (let depth = 0; depth < 10; depth++) {
+    let depth = 0;
+    while (depth < 10) {
         if (isAborted()) return done([]);
+        if (getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions)) {
+            if (await useNextCandidate()) continue;
+            return done([]);
+        }
         if (!consumeQueryBudget(budget)) return done([]);
+        depth++;
 
         let res = getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions);
         try {
@@ -1162,6 +1173,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             const addresses = new Set([...referralAddresses, ...(knownAddresses || [])]);
             if (addresses.size > 0) {
                 for (const ip of addresses) {
+                    if (filterAllowedAddresses([ip], dependencies).length === 0) continue;
                     if (addressedCandidates.length >= limits.maxCandidatesPerReferral) break;
                     addressedCandidates.push({ nsName, ip, zone: delegatedZone });
                 }

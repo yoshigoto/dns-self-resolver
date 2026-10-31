@@ -137,6 +137,100 @@ test('root resolution rejects blocked glue and propagates policy through glueles
     assert.ok(queries.some(query => query.ip === '8.8.8.8'));
 });
 
+test('blocked glue does not consume the referral candidate limit', async () => {
+    const queries = [];
+    const result = await resolveRecordFromRoot('child.test', 'A', new Map(), {
+        isAllowedServerIP: isPublicDnsServerAddress,
+        resolutionLimits: { maxCandidatesPerReferral: 1 },
+        queryDirectlyUDP: async (name, ip, cache, type) => {
+            queries.push(ip);
+            if (ip === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [
+                        { name: 'child.test', type: 'NS', data: 'ns1.child.test' },
+                        { name: 'child.test', type: 'NS', data: 'ns2.child.test' },
+                        { name: 'child.test', type: 'NS', data: 'ns3.child.test' }
+                    ],
+                    additionals: [
+                        { name: 'ns1.child.test', type: 'A', data: '10.0.0.1' },
+                        { name: 'ns2.child.test', type: 'A', data: '127.0.0.1' },
+                        { name: 'ns3.child.test', type: 'A', data: '8.8.8.8' }
+                    ]
+                };
+            }
+            return { answers: [{ name, type, data: '8.8.4.4' }] };
+        }
+    });
+
+    assert.deepEqual(result, ['8.8.4.4']);
+    assert.deepEqual(queries, [ROOT_SERVER_BOOTSTRAP_IP, '8.8.8.8']);
+});
+
+test('a candidate rejected during selection does not consume the query budget', async () => {
+    const queries = [];
+    let blockedCandidateChecks = 0;
+    const policy = ip => {
+        if (ip === '10.0.0.1') return ++blockedCandidateChecks === 1;
+        return isPublicDnsServerAddress(ip);
+    };
+    const result = await resolveRecordFromRoot('child.test', 'A', new Map(), {
+        isAllowedServerIP: policy,
+        resolutionLimits: { maxQueriesPerResolution: 2 },
+        queryDirectlyUDP: async (name, ip, cache, type) => {
+            queries.push(ip);
+            if (ip === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'child.test', type: 'NS', data: 'ns1.child.test' }],
+                    additionals: [
+                        { name: 'ns1.child.test', type: 'A', data: '10.0.0.1' },
+                        { name: 'ns1.child.test', type: 'A', data: '8.8.8.8' }
+                    ]
+                };
+            }
+            return { answers: [{ name, type, data: '8.8.4.4' }] };
+        }
+    });
+
+    assert.deepEqual(result, ['8.8.4.4']);
+    assert.deepEqual(queries, [ROOT_SERVER_BOOTSTRAP_IP, '8.8.8.8']);
+});
+
+test('a candidate rejected during selection does not consume the resolution depth', async () => {
+    const queries = [];
+    const zones = [
+        'test', 'i.test', 'h.i.test', 'g.h.i.test', 'f.g.h.i.test',
+        'e.f.g.h.i.test', 'd.e.f.g.h.i.test', 'c.d.e.f.g.h.i.test',
+        'b.c.d.e.f.g.h.i.test'
+    ];
+    let blockedCandidateChecks = 0;
+    const policy = ip => {
+        if (ip === '10.0.0.1') return ++blockedCandidateChecks === 1;
+        return true;
+    };
+    const result = await resolveRecordFromRoot('a.b.c.d.e.f.g.h.i.test', 'A', new Map(), {
+        isAllowedServerIP: policy,
+        queryDirectlyUDP: async (name, ip, cache, type) => {
+            queries.push(ip);
+            if (queries.length === 10) {
+                return { answers: [{ name, type, data: '8.8.4.4' }] };
+            }
+            const zone = zones[queries.length - 1];
+            const nsName = `ns.${zone}`;
+            const addresses = queries.length === 9
+                ? ['10.0.0.1', '8.8.8.10']
+                : [`8.8.8.${queries.length}`];
+            return {
+                authorities: [{ name: zone, type: 'NS', data: nsName }],
+                additionals: addresses.map(data => ({ name: nsName, type: 'A', data }))
+            };
+        }
+    });
+
+    assert.deepEqual(result, ['8.8.4.4']);
+    assert.equal(queries.length, 10);
+    assert.equal(queries[9], '8.8.8.10');
+});
+
 test('address policy filters literals, known addresses and nameserver cache results', async () => {
     const dependencies = {
         isAllowedServerIP: isPublicDnsServerAddress,
