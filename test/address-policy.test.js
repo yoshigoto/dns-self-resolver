@@ -357,6 +357,37 @@ test('blocked-only final NS answers stay available to diagnostics after an ordin
     }), ['10.0.0.53']);
 });
 
+test('completed blocked-only NS answers are reused by ordinary lookups while diagnostics retain them', async () => {
+    let queries = 0;
+    const dependencies = {
+        isAllowedServerIP: isPublicDnsServerAddress,
+        queryDirectlyUDP: async (name, ip, cache, type) => {
+            queries++;
+            if (ip === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'blocked-cache.test', type: 'NS', data: 'ns.blocked-cache.test' }],
+                    additionals: [{ name: 'ns.blocked-cache.test', type: 'A', data: '8.8.8.8' }]
+                };
+            }
+            return {
+                answers: type === 'A'
+                    ? [{ name, type, data: '10.0.0.53', ttl: 30 }]
+                    : [],
+                flags: dnsPacket.AUTHORITATIVE_ANSWER
+            };
+        }
+    };
+    assert.equal(await resolveServerIPs('host.blocked-cache.test', dependencies), null);
+    const completedQueries = queries;
+    assert.equal(await resolveHostnameIPv4Self('host.blocked-cache.test', dependencies), null);
+    assert.equal(await resolveServerIPs('host.blocked-cache.test', dependencies), null);
+    assert.equal(queries, completedQueries);
+    assert.deepEqual(await resolveServerIPs('host.blocked-cache.test', {
+        ...dependencies, includeBlockedAddresses: true
+    }), ['10.0.0.53']);
+    assert.equal(queries, completedQueries);
+});
+
 test('diagnostic option is not inherited by nested glueless NS address resolution', async () => {
     const queries = [];
     const result = await resolveServerIPs('host.nested-diagnostic.test', {

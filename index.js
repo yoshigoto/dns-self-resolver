@@ -949,11 +949,12 @@ function isNegativelyCached(hostname, gluePolicy, scope, family) {
     return getUnexpiredEntry(nameserverNegativeCache, getNegativeCacheKey(hostname, gluePolicy, scope, family)) !== null;
 }
 
-function cacheNegativeResult(hostname, gluePolicy, scope, family) {
+function cacheNegativeResult(hostname, gluePolicy, scope, family, ttlMs = NAMESERVER_NEGATIVE_CACHE_TTL) {
+    if (!(ttlMs > 0)) return;
     setBounded(
         nameserverNegativeCache,
         getNegativeCacheKey(hostname, gluePolicy, scope, family),
-        { expiresAt: Date.now() + NAMESERVER_NEGATIVE_CACHE_TTL },
+        { expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
         NAMESERVER_CACHE_MAX_ENTRIES
     );
 }
@@ -1299,7 +1300,8 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
         const qTypes = family === 'ANY' ? ['A', 'AAAA'] : [family];
         const results = await Promise.all(qTypes.map(qType =>
             resolveFromRootDetailed(normalized, qType, dnsResponseCache, childDependencies)));
-        const ips = results.flatMap(result => result.records).filter(isIpLiteral);
+        const recordsByType = results.map(result => result.records.filter(isIpLiteral));
+        const ips = recordsByType.flat();
         const allowedIps = filterAllowedAddresses(ips, dependencies);
         if (ips.length > 0) {
             const ttls = results.map(result => result.ttlSeconds).filter(ttl => ttl !== null);
@@ -1307,6 +1309,20 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
                 ? Math.min(Math.min(...ttls) * 1000, NAMESERVER_IP_CACHE_TTL)
                 : NAMESERVER_IP_CACHE_TTL;
             cacheNameserverIPs(normalized, ips, ttlMs, gluePolicy, scope);
+            if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
+                if (allowedIps.length === 0) {
+                    cacheNegativeResult(normalized, gluePolicy, scope, family, ttlMs);
+                }
+                const allowedSet = new Set(allowedIps);
+                recordsByType.forEach((records, index) => {
+                    if (records.length === 0 || records.some(ip => allowedSet.has(ip))) return;
+                    const ttlSeconds = results[index].ttlSeconds;
+                    const familyTtlMs = ttlSeconds === null
+                        ? NAMESERVER_IP_CACHE_TTL
+                        : Math.min(ttlSeconds * 1000, NAMESERVER_IP_CACHE_TTL);
+                    cacheNegativeResult(normalized, gluePolicy, scope, qTypes[index], familyTtlMs);
+                });
+            }
             return includeBlockedAddresses ? ips : (allowedIps.length > 0 ? allowedIps : null);
         }
         // 上限や中断で打ち切られた失敗は経路依存のためキャッシュせず、確定的な失敗のみ短時間キャッシュする
