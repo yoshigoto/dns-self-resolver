@@ -116,6 +116,8 @@ const addresses = await resolveServerIPs('ns.example.com', {
 
 拒否された直接問い合わせは `BLOCKED_ADDRESS`（`retryable: false`）を返し、拒否結果はキャッシュしません。NS アドレス解決は既存の戻り値規約に従い、許可されたアドレスがなければ `null` または例外となります。`resolveRecordFromRoot` は許可された経路で取得できなければ空配列を返します。判定関数には同じ関数インスタンスを再利用することを推奨します。
 
+委任診断などで拒否された最終アドレスも必要な場合、`resolveServerIPs` に `dependencies.includeBlockedAddresses: true` を指定できます。戻り値には最終的な A/AAAA 応答・既知アドレス・キャッシュに含まれる拒否対象も残りますが、解決途中の問い合わせ先や glue 候補には同じ宛先ポリシーが適用されます。このオプションは入れ子の NS 解決には引き継がれません。呼び出し側は戻り値を診断用に分類し、実際の問い合わせには必ず宛先ポリシーを適用してください。既定の戻り値は引き続き許可されたアドレスのみです。
+
 ## エラー
 
 `queryDirectlyUDP` / `queryDirectlyTCP` は、通常の問い合わせ失敗を例外ではなく次の形式のオブジェクトで返します。

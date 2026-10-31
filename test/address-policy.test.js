@@ -305,3 +305,85 @@ test('different policies do not coalesce parallel UDP queries', async t => {
     assert.equal(sends, 2);
     assert.ok(results.every(result => !result.error));
 });
+
+test('diagnostic NS results retain blocked final addresses without allowing blocked referral candidates', async () => {
+    const queries = [];
+    const query = async (name, ip, cache, type) => {
+        assert.equal(isPublicDnsServerAddress(ip), true, ip);
+        queries.push(ip);
+        if (ip === ROOT_SERVER_BOOTSTRAP_IP) {
+            return {
+                authorities: [{ name: 'diagnostic.test', type: 'NS', data: 'ns.diagnostic.test' }],
+                additionals: [
+                    ...Array.from({ length: 20 }, (_, index) => ({
+                        name: 'ns.diagnostic.test', type: 'A', data: `10.0.0.${index + 1}`
+                    })),
+                    { name: 'ns.diagnostic.test', type: 'A', data: '8.8.8.8' }
+                ]
+            };
+        }
+        return {
+            answers: type === 'A'
+                ? ['127.0.0.1', '8.8.4.4'].map(data => ({ name, type, data, ttl: 30 }))
+                : [],
+            flags: dnsPacket.AUTHORITATIVE_ANSWER
+        };
+    };
+    const dependencies = {
+        isAllowedServerIP: isPublicDnsServerAddress,
+        queryDirectlyUDP: query,
+        resolutionLimits: { maxCandidatesPerReferral: 1, maxQueriesPerResolution: 4 }
+    };
+    const diagnostic = await resolveServerIPs('host.diagnostic.test', {
+        ...dependencies, includeBlockedAddresses: true
+    });
+    assert.deepEqual(diagnostic, ['127.0.0.1', '8.8.4.4']);
+    assert.equal(queries.length, 4);
+    assert.deepEqual(await resolveServerIPs('host.diagnostic.test', dependencies), ['8.8.4.4']);
+    assert.equal(queries.length, 4);
+});
+
+test('blocked-only final NS answers stay available to diagnostics after an ordinary lookup', async () => {
+    const dependencies = {
+        isAllowedServerIP: isPublicDnsServerAddress,
+        queryDirectlyUDP: async (name, ip, cache, type) => ({
+            answers: type === 'A' ? [{ name, type, data: '10.0.0.53', ttl: 30 }] : [],
+            flags: dnsPacket.AUTHORITATIVE_ANSWER
+        })
+    };
+    assert.equal(await resolveServerIPs('blocked-only.diagnostic.test', dependencies), null);
+    assert.deepEqual(await resolveServerIPs('blocked-only.diagnostic.test', {
+        ...dependencies, includeBlockedAddresses: true
+    }), ['10.0.0.53']);
+});
+
+test('diagnostic option is not inherited by nested glueless NS address resolution', async () => {
+    const queries = [];
+    const result = await resolveServerIPs('host.nested-diagnostic.test', {
+        isAllowedServerIP: isPublicDnsServerAddress,
+        includeBlockedAddresses: true,
+        queryDirectlyUDP: async (name, ip, cache, type) => {
+            assert.equal(isPublicDnsServerAddress(ip), true, ip);
+            queries.push({ name, ip, type });
+            if (name === 'ns.external-diagnostic.test') {
+                return {
+                    answers: type === 'A'
+                        ? [{ name, type, data: '10.0.0.53', ttl: 30 }]
+                        : [{ name, type, data: '2001:500:2::c', ttl: 30 }]
+                };
+            }
+            if (ip === ROOT_SERVER_BOOTSTRAP_IP) {
+                return {
+                    authorities: [{ name: 'nested-diagnostic.test', type: 'NS', data: 'ns.external-diagnostic.test' }]
+                };
+            }
+            return {
+                answers: type === 'A' ? [{ name, type, data: '127.0.0.1', ttl: 30 }] : [],
+                flags: dnsPacket.AUTHORITATIVE_ANSWER
+            };
+        }
+    });
+    assert.deepEqual(result, ['127.0.0.1']);
+    assert.ok(queries.some(query => query.ip === '2001:500:2::c'));
+    assert.ok(!queries.some(query => query.ip === '10.0.0.53'));
+});
