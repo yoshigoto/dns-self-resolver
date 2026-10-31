@@ -22,6 +22,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 - `resolveRecordFromServer`: 指定した DNS サーバーからレコードを取得します。
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を指定したアドレス種別で解決します。後者は IPv4 を優先し、取得できない場合は IPv6 を試します。
 - `getReferralAddressRecords` / `isInBailiwickGlue` など: 委任応答から利用可能な glue を判定します。
+- `isPublicDnsServerAddress`: 公開権威 DNS 向けの問い合わせ先アドレスを判定します。
 
 ## 使い方
 
@@ -89,8 +90,31 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 | `timeoutMs` | `5000` | 1 回の問い合わせのタイムアウト（ミリ秒）です。 |
 | `signal` | なし | 問い合わせまたは解決処理を中断する `AbortSignal` です。 |
 | `use0x20` | `true` | UDP の質問名の大文字・小文字をランダム化します。 |
+| `isAllowedServerIP` | なし | 問い合わせ先 IP アドレスを受け取り、許可する場合に `true` を返す同期関数です。 |
 
 `queryDirectlyUDP` と `queryDirectlyTCP` は、指定された DNS サーバーが IPv4 または IPv6 のアドレスリテラルであることを要求します。ホスト名を渡す場合は、先に `resolveDnsServerAddress` などで IP アドレスへ解決してください。
+
+### 問い合わせ先のポリシー
+
+ライブラリの既定動作は公開 IP 限定ではありません。社内 DNS やループバック上のテストサーバーにも利用できます。公開 DNS を調べるアプリでは、共通のポリシーを明示的に選択してください。
+
+```js
+import { isPublicDnsServerAddress, queryDirectlyUDP, resolveServerIPs } from 'dns-self-resolver';
+
+const cache = new Map();
+const policy = { isAllowedServerIP: isPublicDnsServerAddress };
+const response = await queryDirectlyUDP('example.com', '198.41.0.4', cache, 'NS', policy);
+const addresses = await resolveServerIPs('ns.example.com', {
+  ...policy,
+  dnsResponseCache: cache
+});
+```
+
+`isPublicDnsServerAddress` は IPv4 の内部・特殊用途範囲を除外し、IPv6 は `2000::/3` 内に限定して Teredo、ベンチマーク、ORCHID / ORCHIDv2、文書用、6to4 の範囲を除外します。IPv4-mapped、NAT64、ULA、リンクローカル、マルチキャスト、`%` 付きアドレスも許可しません。これは公開権威 DNS 向けの保守的な方針であり、すべての特殊用途アドレスの到達可能性を分類するものではありません。アドレス割り当ての変更に応じてライブラリ側の一覧を更新します。
+
+独自の同期判定関数も指定できます。直接問い合わせでは第 5 引数、自己解決では `dependencies.isAllowedServerIP`（または `dependencies.queryOptions.isAllowedServerIP`）に指定します。両方ある場合は前者を優先します。ポリシーは入れ子の NS 解決、glue から得た宛先、EDNS / 0x20 再試行、TCP フォールバックに引き継がれ、送信前と応答キャッシュの参照前に判定されます。NS アドレス解決では、リテラル・既知アドレス・キャッシュ・解決結果から拒否対象を除外します。ポリシーごとにキャッシュと並行問い合わせの共有範囲も分離します。
+
+拒否された直接問い合わせは `BLOCKED_ADDRESS`（`retryable: false`）を返し、拒否結果はキャッシュしません。NS アドレス解決は既存の戻り値規約に従い、許可されたアドレスがなければ `null` または例外となります。`resolveRecordFromRoot` は許可された経路で取得できなければ空配列を返します。判定関数には同じ関数インスタンスを再利用することを推奨します。
 
 ## エラー
 

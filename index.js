@@ -8,6 +8,36 @@ import dgram from 'dgram';
 import { randomBytes, randomInt } from 'crypto';
 import dnsPacket from 'dns-packet';
 
+const NON_PUBLIC_IPV4 = new net.BlockList();
+[
+    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+    ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+    ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+    ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]
+].forEach(([address, prefix]) => NON_PUBLIC_IPV4.addSubnet(address, prefix, 'ipv4'));
+const GLOBAL_UNICAST_IPV6 = new net.BlockList();
+GLOBAL_UNICAST_IPV6.addSubnet('2000::', 3, 'ipv6');
+const NON_PUBLIC_IPV6 = new net.BlockList();
+[
+    ['2001::', 32], ['2001:2::', 48], ['2001:10::', 28], ['2001:20::', 28],
+    ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]
+].forEach(([address, prefix]) => NON_PUBLIC_IPV6.addSubnet(address, prefix, 'ipv6'));
+
+// 公開権威 DNS 向けの保守的なポリシー。汎用の通信 API には無条件で適用しない。
+export function isPublicDnsServerAddress(address) {
+    if (typeof address !== 'string') return false;
+    switch (net.isIP(address)) {
+        case 4:
+            return !NON_PUBLIC_IPV4.check(address, 'ipv4');
+        case 6:
+            return !address.includes('%') &&
+                GLOBAL_UNICAST_IPV6.check(address, 'ipv6') &&
+                !NON_PUBLIC_IPV6.check(address, 'ipv6');
+        default:
+            return false;
+    }
+}
+
 export function isIPv6(ip) {
     return typeof ip === 'string' && ip.includes(':');
 }
@@ -155,7 +185,27 @@ function normalizeQueryOptions(options, defaults = {}) {
 }
 
 function getDnsCacheKey(serverIp, qType, domain, options) {
-    return `${serverIp}|${qType}|${domain}|udpPort:${options.udpPort}|tcpPort:${options.tcpPort}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}|timeout:${options.timeoutMs}`;
+    return `${serverIp}|${qType}|${domain}|udpPort:${options.udpPort}|tcpPort:${options.tcpPort}|edns:${options.useEdns ? 1 : 0}|do:${options.dnssecOk ? 1 : 0}|timeout:${options.timeoutMs}|policy:${getIdentity(options.isAllowedServerIP)}`;
+}
+
+function getBlockedAddressError(domain, serverIp, qType, transport, options) {
+    if (options.isAllowedServerIP === undefined) return null;
+    if (typeof options.isAllowedServerIP !== 'function') {
+        throw new TypeError('isAllowedServerIP must be a function');
+    }
+    if (options.isAllowedServerIP(serverIp)) return null;
+    return buildDnsError('BLOCKED_ADDRESS', {
+        domain, serverIp, qType, transport, retryable: false,
+        detail: `DNS server address ${serverIp} is rejected by isAllowedServerIP`
+    });
+}
+
+function filterAllowedAddresses(ips, dependencies) {
+    const options = {
+        ...(dependencies.queryOptions || {}),
+        ...(dependencies.isAllowedServerIP !== undefined ? { isAllowedServerIP: dependencies.isAllowedServerIP } : {})
+    };
+    return ips.filter(ip => !getBlockedAddressError('', ip, '', 'udp', options));
 }
 
 function getAdditionals(options) {
@@ -317,6 +367,8 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
         if (!isIpLiteral(serverIp)) {
             return resolve(buildInvalidServerError(domain, serverIp, qType, 'tcp'));
         }
+        const blocked = getBlockedAddressError(domain, serverIp, qType, 'tcp', options);
+        if (blocked) return resolve(blocked);
         if (!isValidDnsPort(options.tcpPort)) {
             return resolve(buildInvalidPortError(domain, serverIp, qType, 'tcp', 'tcpPort'));
         }
@@ -467,6 +519,8 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
     if (!isIpLiteral(serverIp)) {
         return Promise.resolve(buildInvalidServerError(domain, serverIp, qType, 'udp'));
     }
+    const blocked = getBlockedAddressError(domain, serverIp, qType, 'udp', options);
+    if (blocked) return Promise.resolve(blocked);
     if (!isValidDnsPort(options.udpPort)) {
         return Promise.resolve(buildInvalidPortError(domain, serverIp, qType, 'udp', 'udpPort'));
     }
@@ -545,6 +599,8 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
         if (!isIpLiteral(serverIp)) {
             return resolve(buildInvalidServerError(domain, serverIp, qType, 'udp'));
         }
+        const blocked = getBlockedAddressError(domain, serverIp, qType, 'udp', options);
+        if (blocked) return resolve(blocked);
 
         const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
         const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
@@ -805,7 +861,8 @@ function getCacheScope(dependencies) {
         dependencies.knownAddresses,
         dependencies.queryDirectlyUDP,
         dependencies.resolveHostnameIPv4Self,
-        dependencies.resolveHostnameIPv6Self
+        dependencies.resolveHostnameIPv6Self,
+        dependencies.isAllowedServerIP || queryOptions.isAllowedServerIP
     ].map(getIdentity);
     return `${parts.every(part => part === '-') ? 'default' : `scope:${parts.join(',')}`}|${portScope}`;
 }
@@ -939,7 +996,8 @@ export async function resolveRecordFromServer(
 
     const results = await Promise.all(
         types.map(async (type) => {
-            const res = await queryUDP(name, serverIp, cache, type, options);
+            const res = getBlockedAddressError(name, serverIp, type, 'udp', options) ||
+                await queryUDP(name, serverIp, cache, type, options);
             if (res?.error || !res?.answers) return [];
             return res.answers
                 .filter(record => record.type === type && normalizeDnsName(record.name) === normalizeDnsName(name))
@@ -972,6 +1030,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
     const nestedDependencies = { ...dependencies, dnsResponseCache: cache, resolutionBudget: budget };
     const queryOptions = {
         ...(dependencies.queryOptions || {}),
+        ...(dependencies.isAllowedServerIP !== undefined ? { isAllowedServerIP: dependencies.isAllowedServerIP } : {}),
         ...(dependencies.signal ? { signal: dependencies.signal } : {})
     };
     const limitHitsAtStart = budget.limitHits;
@@ -1026,9 +1085,9 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         if (isAborted()) return done([]);
         if (!consumeQueryBudget(budget)) return done([]);
 
-        let res;
+        let res = getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions);
         try {
-            res = await queryUDP(queryName, currentServerIp, cache, qType, queryOptions);
+            res ||= await queryUDP(queryName, currentServerIp, cache, qType, queryOptions);
         } catch (e) {
             res = { error: 'QUERY_EXCEPTION', detail: e?.message };
         }
@@ -1139,6 +1198,9 @@ export async function resolveDnsServerAddressByType(
 ) {
     const normalized = normalizeDnsName(dnsServer);
     if (net.isIP(normalized)) {
+        if (filterAllowedAddresses([normalized], dependencies).length === 0) {
+            throw new Error(`DNS server address ${dnsServer} is rejected by isAllowedServerIP`);
+        }
         return normalized;
     }
     if (resolutionDepth >= 5) {
@@ -1147,7 +1209,8 @@ export async function resolveDnsServerAddressByType(
 
     const family = preferIpv6 ? 'AAAA' : 'A';
     const known = getKnownAddress(dependencies.knownAddresses, normalized, family);
-    if (known && known.length > 0) return known[0];
+    const allowedKnown = filterAllowedAddresses(known || [], dependencies);
+    if (allowedKnown.length > 0) return allowedKnown[0];
 
     const cache = dependencies.dnsResponseCache || dependencies.cache || new Map();
     const resolver = dependencies.resolveRecordFromRoot || resolveRecordFromRoot;
@@ -1155,7 +1218,7 @@ export async function resolveDnsServerAddressByType(
         ...dependencies,
         resolvingStack: new Set(dependencies.resolvingStack || []).add(normalized)
     });
-    const address = (addresses || []).find(candidate =>
+    const address = filterAllowedAddresses(addresses || [], dependencies).find(candidate =>
         net.isIP(candidate) === (preferIpv6 ? 6 : 4));
     if (address) return address;
     throw new Error(`DNSサーバー名 ${dnsServer} の ${family} レコードが見つかりませんでした。`);
@@ -1218,7 +1281,7 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
         const qTypes = family === 'ANY' ? ['A', 'AAAA'] : [family];
         const results = await Promise.all(qTypes.map(qType =>
             resolveFromRootDetailed(normalized, qType, dnsResponseCache, childDependencies)));
-        const ips = results.flatMap(result => result.records).filter(isIpLiteral);
+        const ips = filterAllowedAddresses(results.flatMap(result => result.records).filter(isIpLiteral), dependencies);
         if (ips.length > 0) {
             const ttls = results.map(result => result.ttlSeconds).filter(ttl => ttl !== null);
             const ttlMs = ttls.length > 0
@@ -1247,14 +1310,15 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const normalized = normalizeDnsName(hostname);
     const gluePolicy = dependencies.gluePolicy || 'strict';
     if (net.isIP(normalized)) {
-        return isIPv6(normalized) ? null : normalized;
+        return !isIPv6(normalized) && filterAllowedAddresses([normalized], dependencies).length > 0 ? normalized : null;
     }
 
     const known = getKnownAddress(dependencies.knownAddresses, normalized, 'A');
-    if (known && known.length > 0) return known[0];
+    const allowedKnown = filterAllowedAddresses(known || [], dependencies);
+    if (allowedKnown.length > 0) return allowedKnown[0];
 
     const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const cachedV4 = cached?.find(ip => !isIPv6(ip));
+    const cachedV4 = filterAllowedAddresses(cached || [], dependencies).find(ip => !isIPv6(ip));
     if (cachedV4) return cachedV4;
 
     const ips = await resolveNameserverAddresses(normalized, dependencies, 'A', inFlightIpv4Resolutions);
@@ -1266,14 +1330,15 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const normalized = normalizeDnsName(hostname);
     const gluePolicy = dependencies.gluePolicy || 'strict';
     if (net.isIP(normalized)) {
-        return isIPv6(normalized) ? normalized : null;
+        return isIPv6(normalized) && filterAllowedAddresses([normalized], dependencies).length > 0 ? normalized : null;
     }
 
     const known = getKnownAddress(dependencies.knownAddresses, normalized, 'AAAA');
-    if (known && known.length > 0) return known[0];
+    const allowedKnown = filterAllowedAddresses(known || [], dependencies);
+    if (allowedKnown.length > 0) return allowedKnown[0];
 
     const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const cachedV6 = cached?.find(ip => isIPv6(ip));
+    const cachedV6 = filterAllowedAddresses(cached || [], dependencies).find(ip => isIPv6(ip));
     if (cachedV6) return cachedV6;
 
     const ips = await resolveNameserverAddresses(normalized, dependencies, 'AAAA', inFlightIpv6Resolutions);
@@ -1284,13 +1349,18 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
 export async function resolveServerIPs(nsName, dependencies = {}) {
     const normalized = normalizeDnsName(nsName);
     const gluePolicy = dependencies.gluePolicy || 'strict';
-    if (net.isIP(normalized)) return [normalized];
+    if (net.isIP(normalized)) {
+        const allowed = filterAllowedAddresses([normalized], dependencies);
+        return allowed.length > 0 ? allowed : null;
+    }
 
     const known = getKnownAddress(dependencies.knownAddresses, normalized);
-    if (known && known.length > 0) return known;
+    const allowedKnown = filterAllowedAddresses(known || [], dependencies);
+    if (allowedKnown.length > 0) return allowedKnown;
 
     const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    if (cached && cached.length > 0) return cached;
+    const allowedCached = filterAllowedAddresses(cached || [], dependencies);
+    if (allowedCached.length > 0) return allowedCached;
 
     return resolveNameserverAddresses(normalized, dependencies, 'ANY', inFlightServerResolutions);
 }
