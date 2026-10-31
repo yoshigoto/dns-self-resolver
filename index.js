@@ -916,7 +916,11 @@ function getUnexpiredEntry(map, key) {
 
 export function getCachedNameserverIPs(hostname, gluePolicy = 'strict', dependencies = {}) {
     const key = getNameserverResolutionKey(hostname, gluePolicy, getCacheScope(dependencies));
-    return getUnexpiredEntry(nameserverIpCache, key)?.ips || null;
+    const ips = getUnexpiredEntry(nameserverIpCache, key)?.ips;
+    if (!ips) return null;
+    const selected = dependencies.includeBlockedAddresses === true
+        ? ips : filterAllowedAddresses(ips, dependencies);
+    return selected.length > 0 ? selected : null;
 }
 
 export function cacheNameserverIPs(
@@ -945,11 +949,12 @@ function isNegativelyCached(hostname, gluePolicy, scope, family) {
     return getUnexpiredEntry(nameserverNegativeCache, getNegativeCacheKey(hostname, gluePolicy, scope, family)) !== null;
 }
 
-function cacheNegativeResult(hostname, gluePolicy, scope, family) {
+function cacheNegativeResult(hostname, gluePolicy, scope, family, ttlMs = NAMESERVER_NEGATIVE_CACHE_TTL) {
+    if (!(ttlMs > 0)) return;
     setBounded(
         nameserverNegativeCache,
         getNegativeCacheKey(hostname, gluePolicy, scope, family),
-        { expiresAt: Date.now() + NAMESERVER_NEGATIVE_CACHE_TTL },
+        { expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
         NAMESERVER_CACHE_MAX_ENTRIES
     );
 }
@@ -1272,7 +1277,8 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
     }
     if (isNegativelyCached(normalized, gluePolicy, scope, family)) return null;
 
-    const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}`;
+    const includeBlockedAddresses = family === 'ANY' && dependencies.includeBlockedAddresses === true;
+    const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}|includeBlocked:${includeBlockedAddresses ? 1 : 0}`;
     const shareInFlight = !dependencies.signal;
     if (shareInFlight && inFlightMap.has(resolutionKey)) {
         const shared = await inFlightMap.get(resolutionKey);
@@ -1284,6 +1290,7 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
     const budget = getResolutionBudget(dependencies);
     const childDependencies = {
         ...dependencies,
+        includeBlockedAddresses: false,
         resolvingStack: new Set(resolvingStack).add(normalized),
         resolutionBudget: budget
     };
@@ -1293,14 +1300,30 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
         const qTypes = family === 'ANY' ? ['A', 'AAAA'] : [family];
         const results = await Promise.all(qTypes.map(qType =>
             resolveFromRootDetailed(normalized, qType, dnsResponseCache, childDependencies)));
-        const ips = filterAllowedAddresses(results.flatMap(result => result.records).filter(isIpLiteral), dependencies);
+        const recordsByType = results.map(result => result.records.filter(isIpLiteral));
+        const ips = recordsByType.flat();
+        const allowedIps = filterAllowedAddresses(ips, dependencies);
         if (ips.length > 0) {
             const ttls = results.map(result => result.ttlSeconds).filter(ttl => ttl !== null);
             const ttlMs = ttls.length > 0
                 ? Math.min(Math.min(...ttls) * 1000, NAMESERVER_IP_CACHE_TTL)
                 : NAMESERVER_IP_CACHE_TTL;
             cacheNameserverIPs(normalized, ips, ttlMs, gluePolicy, scope);
-            return ips;
+            if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
+                if (allowedIps.length === 0) {
+                    cacheNegativeResult(normalized, gluePolicy, scope, family, ttlMs);
+                }
+                const allowedSet = new Set(allowedIps);
+                recordsByType.forEach((records, index) => {
+                    if (records.length === 0 || records.some(ip => allowedSet.has(ip))) return;
+                    const ttlSeconds = results[index].ttlSeconds;
+                    const familyTtlMs = ttlSeconds === null
+                        ? NAMESERVER_IP_CACHE_TTL
+                        : Math.min(ttlSeconds * 1000, NAMESERVER_IP_CACHE_TTL);
+                    cacheNegativeResult(normalized, gluePolicy, scope, qTypes[index], familyTtlMs);
+                });
+            }
+            return includeBlockedAddresses ? ips : (allowedIps.length > 0 ? allowedIps : null);
         }
         // 上限や中断で打ち切られた失敗は経路依存のためキャッシュせず、確定的な失敗のみ短時間キャッシュする
         if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
@@ -1361,17 +1384,19 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
 export async function resolveServerIPs(nsName, dependencies = {}) {
     const normalized = normalizeDnsName(nsName);
     const gluePolicy = dependencies.gluePolicy || 'strict';
+    const selectAddresses = ips => dependencies.includeBlockedAddresses === true
+        ? ips : filterAllowedAddresses(ips, dependencies);
     if (net.isIP(normalized)) {
-        const allowed = filterAllowedAddresses([normalized], dependencies);
+        const allowed = selectAddresses([normalized]);
         return allowed.length > 0 ? allowed : null;
     }
 
     const known = getKnownAddress(dependencies.knownAddresses, normalized);
-    const allowedKnown = filterAllowedAddresses(known || [], dependencies);
+    const allowedKnown = selectAddresses(known || []);
     if (allowedKnown.length > 0) return allowedKnown;
 
     const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const allowedCached = filterAllowedAddresses(cached || [], dependencies);
+    const allowedCached = selectAddresses(cached || []);
     if (allowedCached.length > 0) return allowedCached;
 
     return resolveNameserverAddresses(normalized, dependencies, 'ANY', inFlightServerResolutions);
