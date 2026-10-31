@@ -116,6 +116,30 @@ export function getReferralAddressRecords(
     return additionals.filter(record => selected.has(record));
 }
 
+export function getReferralNameserverCandidates(
+    nsRecords,
+    additionals,
+    delegatedZone,
+    { gluePolicy = 'strict', serverZone = delegatedZone, addressTypes = ['A', 'AAAA'] } = {}
+) {
+    if (!Array.isArray(addressTypes) || addressTypes.some(type => !['A', 'AAAA'].includes(type))) {
+        throw new TypeError('addressTypes must be an array containing only A or AAAA');
+    }
+    const records = nsRecords.filter(record => record.type === 'NS');
+    const addressRecords = getReferralAddressRecords(
+        additionals, records.map(record => record.data), delegatedZone, gluePolicy, serverZone
+    ).filter(record => addressTypes.includes(record.type));
+    const candidates = records.map(nsRecord => {
+        const nsName = normalizeDnsName(nsRecord.data);
+        return {
+            nsRecord,
+            nsName,
+            addressRecords: addressRecords.filter(record => normalizeDnsName(record.name) === nsName)
+        };
+    });
+    return { addressRecords, candidates };
+}
+
 export const DNS_CACHE_TTL = {
     success: 30000,
     transient: 2000,
@@ -1068,13 +1092,29 @@ export async function resolveRecordFromServer(
     return results.flat();
 }
 
-// referral は「問い合わせ中のサーバーゾーンの真の子孫」かつ「問い合わせ名の祖先 (または同一)」でなければならない。
-// 上向き・横向きの referral (lame delegation や偽装) を受け入れると、解決経路を任意のサーバーへ誘導されうる
-function isValidReferral(delegatedZone, serverZone, queryName) {
-    if (!delegatedZone) return false;
-    if (!isSubdomainOrEqual(queryName, delegatedZone)) return false;
-    if (serverZone === '.' || !normalizeDnsName(serverZone)) return true;
-    return delegatedZone !== normalizeDnsName(serverZone) && isSubdomainOrEqual(delegatedZone, serverZone);
+export function isValidReferral(
+    delegatedZone,
+    serverZone,
+    queryName,
+    { queryNamePolicy = 'ancestor', requireBelowServerZone = true } = {}
+) {
+    if (!['ancestor', 'exact', 'related'].includes(queryNamePolicy)) {
+        throw new TypeError('queryNamePolicy must be ancestor, exact or related');
+    }
+    if (typeof requireBelowServerZone !== 'boolean') {
+        throw new TypeError('requireBelowServerZone must be a boolean');
+    }
+    const zone = normalizeDnsName(delegatedZone);
+    if (!zone) return false;
+    const matchesQuery = queryNamePolicy === 'exact'
+        ? zone === normalizeDnsName(queryName)
+        : queryNamePolicy === 'related'
+            ? hasParentChildRelationship(queryName, zone)
+            : isSubdomainOrEqual(queryName, zone);
+    if (!matchesQuery) return false;
+    if (!requireBelowServerZone) return true;
+    const parent = normalizeDnsName(serverZone);
+    return !parent || (zone !== parent && isSubdomainOrEqual(zone, parent));
 }
 
 // ルートから委任を辿って解決し、レコードと TTL、および上限・中断で打ち切られていないかを返す
@@ -1210,20 +1250,16 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
 
         const nsNames = [...new Set(nsRecords.map(r => normalizeDnsName(r.data)).filter(Boolean))];
         const referralAddressByNsName = new Map();
-        getReferralAddressRecords(
-            res.additionals || [],
-            nsNames,
-            delegatedZone,
-            gluePolicy,
-            currentServerZone
-        )
-            .forEach(record => {
-                if (!isIpLiteral(record.data)) return;
-                const key = normalizeDnsName(record.name);
-                const addresses = referralAddressByNsName.get(key) || [];
-                if (!addresses.includes(record.data)) addresses.push(record.data);
-                referralAddressByNsName.set(key, addresses);
-            });
+        const referral = getReferralNameserverCandidates(nsRecords, res.additionals || [], delegatedZone, {
+            gluePolicy, serverZone: currentServerZone
+        });
+        referral.addressRecords.forEach(record => {
+            if (!isIpLiteral(record.data)) return;
+            const key = normalizeDnsName(record.name);
+            const addresses = referralAddressByNsName.get(key) || [];
+            if (!addresses.includes(record.data)) addresses.push(record.data);
+            referralAddressByNsName.set(key, addresses);
+        });
 
         // 参照アドレスを持つ候補を優先し、無い候補は捨てずにフォールバック用に保持する。
         // knownAddresses が指定されていれば referral アドレスがない候補の事前解決アドレスとしても参照する。

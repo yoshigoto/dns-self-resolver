@@ -23,6 +23,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 - `resolveDnsServerAddressByType` / `resolveDnsServerAddress`: DNS サーバー名を指定したアドレス種別で解決します。後者は IPv4 を優先し、取得できない場合は IPv6 を試します。
 - `getReferralAddressRecords` / `isInBailiwickGlue` など: 委任応答から利用可能な glue を判定します。
 - `classifyReferralAddressRecords`: NS 名に対応する ADDITIONAL の A/AAAA を `in-domain`、`sibling`、`unrelated` に分類します。解決候補への採用とは独立した処理です。
+- `isValidReferral` / `getReferralNameserverCandidates`: referral の名前関係を判定し、選択した glue 方針に沿って NS ごとのアドレス候補を組み立てます。
 - `isPublicDnsServerAddress`: 公開権威 DNS 向けの問い合わせ先アドレスを判定します。
 - `createQueryBudget`: 再送・TCP フォールバックを含む送信回数の共有予算を作ります。
 
@@ -93,6 +94,34 @@ const candidates = getReferralAddressRecords(
 ```
 
 分類結果は `{ inDomainGlueRecords, siblingGlueRecords, unrelatedAddressRecords }` です。NS 名に対応しないレコードや A/AAAA 以外はどの配列にも含めません。名前は大文字・小文字と末尾ドットを正規化して比較し、元のレコードと順序を維持します。DNS 応答は変更しません。親ゾーンには実際に応答したサーバーのゾーンを渡してください（ルートは `'.'` または `''`）。省略時のみ、従来の診断処理との互換性のため委任先名から左端のラベルを除いた名前を使います。この省略時の値は実際のゾーンカットを探索した結果ではありません。
+
+### referral の妥当性と NS 候補
+
+```js
+import { isValidReferral, getReferralNameserverCandidates } from 'dns-self-resolver';
+
+if (isValidReferral(delegatedZone, serverZone, queryName)) {
+  const { addressRecords, candidates } = getReferralNameserverCandidates(
+    nsRecords, additionals, delegatedZone,
+    { gluePolicy: 'strict', serverZone, addressTypes: ['A', 'AAAA'] }
+  );
+}
+```
+
+`isValidReferral(delegatedZone, serverZone, queryName, policy)` は名前関係だけを判定する純粋関数です。名前の大小文字と末尾ドットを正規化し、空またはルートの委任先は拒否します。AA、rcode、CNAME/DNAME、SOA、NS レコードの所属ゾーン、探索履歴は呼び出し側で確認してください。
+
+| ポリシー | 既定値 | 意味 |
+|---|---|---|
+| `queryNamePolicy` | `ancestor` | 委任先が問い合わせ名の祖先または同一であることを要求します。`exact` は同一だけ、`related` は祖先・子孫・同一を許可します。 |
+| `requireBelowServerZone` | `true` | 委任先が現在のサーバーゾーンの真の子孫であることを要求します。サーバーゾーン `'.'` / `''` はルートとして扱います。 |
+
+既定値は従来の自己解決と同じで、上向き・横向き・同一ゾーンへの referral を拒否します。`requireBelowServerZone: false` はサーバーゾーンとの関係を判定しない診断用の指定です。特に `related` は不正な委任経路も観測する用途のため、一般の自己解決にそのまま利用しないでください。不正なポリシーは `TypeError` になります。
+
+`getReferralNameserverCandidates(nsRecords, additionals, delegatedZone, options)` は通信・自己解決・宛先許可判定を行いません。呼び出し側で選んだ NS レコードを渡してください。`gluePolicy` と `serverZone` は `getReferralAddressRecords` と同じ意味・既定値で、`addressTypes` は `['A', 'AAAA']` が既定です。A または AAAA 以外の指定は `TypeError` になります。
+
+戻り値は `{ addressRecords, candidates }` です。`addressRecords` は採用可能な ADDITIONAL のレコードを元の順序で保持し、`candidates` は NS ごとの `{ nsRecord, nsName, addressRecords }` を NS の順序で返します。`nsName` のみ正規化し、元のレコード参照・重複を保持します。glue のない NS も空の `addressRecords` を持つ候補として残します。非 NS レコードは候補にしません。非公開・不正なアドレスデータは診断を妨げないよう削除せず、宛先ポリシー・重複除去・候補数制限・送信前検査は別途適用してください。
+
+ゾーン頂点探索全体は共通化しません。委任チェッカーの探索は `exact`、診断追跡は `related`（いずれも `requireBelowServerZone: false`）を選び、`in-domain-only` と A/AAAA の複数候補を維持します。DNSSEC 側の SOA 探索は既定の `ancestor` と下位ゾーン判定、`strict` と A の候補を選び、in-domain glue 優先・1候補の選択をアプリ側に残します。SOA の採用、親子同居、循環・繰り返し判定、診断表示も各アプリ側の責務です。
 
 ## 問い合わせオプション
 
