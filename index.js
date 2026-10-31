@@ -68,8 +68,31 @@ export function isInBailiwickGlue(record, nsNames, delegatedZone) {
         isSubdomainOrEqual(record.name, delegatedZone);
 }
 
-// 委任 owner 配下の glue を使い、root referral では root が返す TLD NS glue も許可する。
-// それ以外の out-of-bailiwick な追加レコードは authoritative な A/AAAA 解決を迂回するため利用しない。
+export function classifyReferralAddressRecords(
+    additionals,
+    nsNames,
+    delegatedZone,
+    parentZone = normalizeDnsName(delegatedZone).split('.').slice(1).join('.')
+) {
+    const normalizedNsNames = new Set(nsNames.map(normalizeDnsName));
+    const normalizedParentZone = normalizeDnsName(parentZone);
+    const inDomainGlueRecords = [];
+    const siblingGlueRecords = [];
+    const unrelatedAddressRecords = [];
+    for (const record of additionals) {
+        if ((record.type !== 'A' && record.type !== 'AAAA') ||
+            !normalizedNsNames.has(normalizeDnsName(record.name))) continue;
+        if (isSubdomainOrEqual(record.name, delegatedZone)) {
+            inDomainGlueRecords.push(record);
+        } else if (!normalizedParentZone || isSubdomainOrEqual(record.name, normalizedParentZone)) {
+            siblingGlueRecords.push(record);
+        } else {
+            unrelatedAddressRecords.push(record);
+        }
+    }
+    return { inDomainGlueRecords, siblingGlueRecords, unrelatedAddressRecords };
+}
+
 export function getReferralAddressRecords(
     additionals,
     nsNames,
@@ -77,24 +100,20 @@ export function getReferralAddressRecords(
     gluePolicy = 'strict',
     serverZone = delegatedZone
 ) {
-    const normalizedNsNames = new Set(nsNames.map(normalizeDnsName));
-    const isNsAddressRecord = record =>
-        (record.type === 'A' || record.type === 'AAAA') &&
-        normalizedNsNames.has(normalizeDnsName(record.name));
-
-    if (gluePolicy === 'strict') {
-        const isRootReferral = serverZone === '.';
-        return additionals.filter(record =>
-            isNsAddressRecord(record) &&
-            (isRootReferral || isSubdomainOrEqual(record.name, delegatedZone)));
-    }
-    if (gluePolicy !== 'allow-sibling') {
+    if (!['strict', 'in-domain-only', 'allow-sibling'].includes(gluePolicy)) {
         throw new Error(`未対応の gluePolicy です: ${gluePolicy}`);
     }
-    return additionals.filter(record =>
-        isNsAddressRecord(record) &&
-        (!normalizeDnsName(serverZone) ||
-            isSubdomainOrEqual(record.name, serverZone)));
+    const { inDomainGlueRecords, siblingGlueRecords, unrelatedAddressRecords } =
+        classifyReferralAddressRecords(additionals, nsNames, delegatedZone, serverZone);
+    let selectedRecords = inDomainGlueRecords;
+    if (gluePolicy === 'strict' && serverZone === '.') {
+        selectedRecords = [...inDomainGlueRecords, ...siblingGlueRecords, ...unrelatedAddressRecords];
+    } else if (gluePolicy === 'allow-sibling') {
+        selectedRecords = [...inDomainGlueRecords, ...siblingGlueRecords].filter(record =>
+            !normalizeDnsName(serverZone) || isSubdomainOrEqual(record.name, serverZone));
+    }
+    const selected = new Set(selectedRecords);
+    return additionals.filter(record => selected.has(record));
 }
 
 export const DNS_CACHE_TTL = {
