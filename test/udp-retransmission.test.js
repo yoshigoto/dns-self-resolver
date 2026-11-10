@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
+import net from 'node:net';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import dnsPacket from 'dns-packet';
 
-import { createQueryBudget, queryDirectlyUDP } from '../index.js';
+import { createQueryBudget, queryDirectlyUDP, resolveHostnameIPv4Self } from '../index.js';
 
 const serverIp = '127.0.0.1';
 const answerFor = query => ({
@@ -79,13 +80,96 @@ test('retransmissions consume the query budget and stop when it is exhausted', a
     const udp = await startUdpServer(t);
     const queryBudget = createQueryBudget(2);
 
-    const result = await queryDirectlyUDP('budget.example.test', serverIp, new Map(), 'A', {
+    const cache = new Map();
+    const result = await queryDirectlyUDP('budget.example.test', serverIp, cache, 'A', {
         ...fastRetry(udp.port), queryBudget
     });
 
     assert.equal(result.error, 'TIMEOUT');
+    assert.equal(result.retryBudgetExhausted, true);
     assert.equal(udp.received.length, 2);
     assert.deepEqual(queryBudget, { remaining: 0, exhausted: true });
+    // 予算に依存する失敗はキャッシュしない
+    assert.equal(cache.size, 0);
+});
+
+test('a timeout limited by the query budget does not negatively cache the nameserver name', async (t) => {
+    let silent = true;
+    const udp = await startUdpServer(t, (reply) => { if (!silent) reply(); });
+    const dependencies = queryBudget => ({
+        rootServers: [serverIp],
+        queryOptions: fastRetry(udp.port),
+        dnsResponseCache: new Map(),
+        queryBudget
+    });
+
+    assert.equal(await resolveHostnameIPv4Self('ns.budget-limited.test', dependencies(createQueryBudget(1))), null);
+    silent = false;
+    assert.equal(
+        await resolveHostnameIPv4Self('ns.budget-limited.test', dependencies(createQueryBudget(10))),
+        '192.0.2.20'
+    );
+});
+
+test('explicitly undefined retry options fall back to the defaults', async (t) => {
+    const udp = await startUdpServer(t);
+
+    const result = await queryDirectlyUDP('undefined-options.example.test', serverIp, new Map(), 'A', {
+        udpPort: udp.port, timeoutMs: 200, udpTries: undefined, udpRetryIntervalMs: undefined
+    });
+
+    assert.equal(result.error, 'TIMEOUT');
+    // 既定の再送間隔 (1 秒) は timeoutMs を超えるため、送信は 1 回だけ
+    assert.equal(udp.received.length, 1);
+});
+
+test('the UDP attempt count is kept when a retransmission leads to a TCP fallback', async (t) => {
+    const udp = dgram.createSocket('udp4');
+    let udpQueries = 0;
+    udp.on('message', (message, rinfo) => {
+        if (++udpQueries < 2) return;
+        const query = dnsPacket.decode(message);
+        udp.send(dnsPacket.encode({
+            type: 'response', id: query.id, flags: dnsPacket.TRUNCATED_RESPONSE, questions: query.questions
+        }), rinfo.port, rinfo.address);
+    });
+    await new Promise(resolve => udp.bind(0, serverIp, resolve));
+    t.after(() => udp.close());
+    const tcp = net.createServer((socket) => {
+        socket.on('error', () => {});
+        socket.on('data', data => socket.end(dnsPacket.streamEncode(answerFor(dnsPacket.streamDecode(data)))));
+    });
+    await new Promise(resolve => tcp.listen(0, serverIp, resolve));
+    t.after(() => tcp.close());
+    const cache = new Map();
+    const options = { ...fastRetry(udp.address().port), tcpPort: tcp.address().port };
+
+    const result = await queryDirectlyUDP('lost-then-truncated.example.test', serverIp, cache, 'A', options);
+    const cached = await queryDirectlyUDP('lost-then-truncated.example.test', serverIp, cache, 'A', options);
+
+    for (const response of [result, cached]) {
+        assert.equal(response.retryFrom, 'udp-truncated');
+        assert.equal(response.udpAttempts, 2);
+    }
+    assert.equal(cached.isCached, true);
+});
+
+test('a retransmission that becomes due after the deadline is not sent', async (t) => {
+    const udp = await startUdpServer(t);
+
+    // 3 回目の再送 (90 ms 後) の前からイベントループを止め、timeoutMs (100 ms) を過ぎてから再開させる
+    const pending = queryDirectlyUDP('stalled.example.test', serverIp, new Map(), 'A', {
+        ...fastRetry(udp.port), timeoutMs: 100
+    });
+    setTimeout(() => {
+        const resumeAt = Date.now() + 120;
+        while (Date.now() < resumeAt);
+    }, 50);
+    const result = await pending;
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    assert.equal(result.error, 'TIMEOUT');
+    assert.equal(udp.received.length, 2);
 });
 
 test('udpTries and timeoutMs bound the number of transmissions', async (t) => {
@@ -103,7 +187,13 @@ test('udpTries and timeoutMs bound the number of transmissions', async (t) => {
     }
 });
 
-test('by default a query is sent at 0 s, 1 s and 3 s and times out at 5 s', async (t) => {
+// Date を含むモックタイマーは Node.js 20.11 / 21.2 以降でのみ利用できる
+const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
+const hasDateMockTimers = nodeMajor > 21 || (nodeMajor === 21 && nodeMinor >= 2) || (nodeMajor === 20 && nodeMinor >= 11);
+
+test('by default a query is sent at 0 s, 1 s and 3 s and times out at 5 s', {
+    skip: hasDateMockTimers ? false : 'mock timers with Date are not available on this Node.js version'
+}, async (t) => {
     const sentAt = [];
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     t.mock.method(dgram, 'createSocket', () => {

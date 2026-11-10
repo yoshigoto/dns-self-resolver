@@ -251,7 +251,9 @@ function normalizeQueryOptions(options, defaults = {}) {
     if (typeof options === 'boolean') {
         return { ...defaults, useEdns: options };
     }
-    const normalized = { ...defaults, ...(options || {}) };
+    // 明示的に undefined を渡されたオプションで既定値を消さない (例: { udpTries: undefined })
+    const provided = Object.fromEntries(Object.entries(options || {}).filter(([, value]) => value !== undefined));
+    const normalized = { ...defaults, ...provided };
     if (normalized.queryBudget !== undefined &&
         (!normalized.queryBudget || !Number.isSafeInteger(normalized.queryBudget.remaining) ||
             normalized.queryBudget.remaining < 0)) {
@@ -731,6 +733,8 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
         const startedAt = Date.now();
         // 再送した場合だけ、結果に送信回数を付ける
         const attemptInfo = () => (attempts > 1 ? { udpAttempts: attempts } : {});
+        // 送信予算が尽きて再送できなかった場合の失敗は、予算に依存する結果なのでキャッシュしない
+        let retryBudgetExhausted = false;
 
         const closeClient = () => {
             if (retransmitTimer) clearTimeout(retransmitTimer);
@@ -801,15 +805,19 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 }));
             }
             if (lastDecodeError !== null) {
-                const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'udp', detail: lastDecodeError, retryable: false });
-                setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
+                const decodeError = {
+                    ...buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'udp', detail: lastDecodeError, retryable: false }),
+                    ...(retryBudgetExhausted ? { retryBudgetExhausted } : {})
+                };
+                if (!retryBudgetExhausted) setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
                 return finish(decodeError);
             }
             const timeoutResult = {
                 ...buildDnsError('TIMEOUT', { domain, serverIp, qType, transport: 'udp', retryable: true }),
-                ...attemptInfo()
+                ...attemptInfo(),
+                ...(retryBudgetExhausted ? { retryBudgetExhausted } : {})
             };
-            setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
+            if (!retryBudgetExhausted) setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
             return finish(timeoutResult);
         }, options.timeoutMs);
 
@@ -863,7 +871,8 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                     return handOff(queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType, options)
                         .then(
                             (tcpResult) => {
-                                const annotations = { retryFrom: 'udp-truncated', isFallback: true };
+                                // TCP へ切り替える前に UDP を再送していた場合は、その送信回数も残す
+                                const annotations = { retryFrom: 'udp-truncated', isFallback: true, ...attemptInfo() };
                                 shareCachedResult(dnsResponseCache, cacheKey, cacheKey, annotations);
                                 return { ...tcpResult, transport: tcpResult?.transport || 'tcp', ...annotations };
                             },
@@ -899,8 +908,13 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
             retransmitTimer = setTimeout(() => {
                 retransmitTimer = null;
                 if (settled || !client) return;
+                // イベントループの停滞で期限を過ぎてから実行された場合は送信しない
+                if (Date.now() - startedAt >= options.timeoutMs) return;
                 // 送信予算が尽きた場合は再送せず、送信済みの問い合わせへの応答を待ち続ける
-                if (getQueryLimitError(domain, serverIp, qType, 'udp', options, true)) return;
+                if (getQueryLimitError(domain, serverIp, qType, 'udp', options, true)) {
+                    retryBudgetExhausted = true;
+                    return;
+                }
                 sendQuery();
             }, delayMs);
         };
@@ -1410,7 +1424,9 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
         // 宛先拒否など、サーバーの到達性と無関係な失敗では後回しの状態を変えない。
         // キャッシュから復元した結果も今回の到達性の観測ではないため対象外とする
-        if (currentServerZone === '.' && res && res.isCached !== true) {
+        // 送信予算が尽きて再送できなかった失敗は経路依存の打ち切りとして扱い、ネガティブキャッシュさせない
+        if (res?.retryBudgetExhausted) budget.limitHits++;
+        if (currentServerZone === '.' && res && res.isCached !== true && !res.retryBudgetExhausted) {
             if (isErrorRcode || ['TIMEOUT', 'SOCKET_ERROR', 'SEND_ERROR'].includes(res.error)) {
                 recordRootServerResult(currentServerIp, true);
             } else if (!res.error) {
