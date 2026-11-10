@@ -66,6 +66,42 @@ test('an authoritative NODATA for AAAA is cached together with the A addresses',
     assert.equal(sent, sentAfterFirst);
 });
 
+test('a cached family is reused and only the missing family is resolved', async () => {
+    let failA = false;
+    const sent = { A: 0, AAAA: 0 };
+    const queryDirectlyUDP = async (name, serverIp, cache, qType) => {
+        sent[qType]++;
+        if (qType === 'AAAA') return { flags: AA, rcode: 'NOERROR', answers: [], authorities: [], additionals: [] };
+        return failA ? { error: 'TIMEOUT', retryable: true } : answer('A', name, '192.0.2.53');
+    };
+    const dependencies = { queryDirectlyUDP };
+
+    assert.equal(await resolveHostnameIPv4Self('ns.partial-cache.test', dependencies), '192.0.2.53');
+    failA = true;
+    sent.A = 0;
+    assert.deepEqual(await resolveServerIPs('ns.partial-cache.test', dependencies), ['192.0.2.53']);
+    assert.deepEqual(sent, { A: 0, AAAA: 1 });
+    assert.deepEqual(await resolveServerIPs('ns.partial-cache.test', dependencies), ['192.0.2.53']);
+    assert.deepEqual(sent, { A: 0, AAAA: 1 });
+});
+
+test('a cached family is kept when resolving the missing family fails', async () => {
+    let failing = false;
+    const queryDirectlyUDP = async (name, serverIp, cache, qType) => failing
+        ? { error: 'TIMEOUT', retryable: true }
+        : answer(qType, name, qType === 'A' ? '192.0.2.53' : '2001:db8::53');
+    const dependencies = { queryDirectlyUDP };
+
+    assert.equal(await resolveHostnameIPv4Self('ns.partial-flaky.test', dependencies), '192.0.2.53');
+    failing = true;
+    assert.deepEqual(await resolveServerIPs('ns.partial-flaky.test', dependencies), ['192.0.2.53']);
+    failing = false;
+    assert.deepEqual(
+        await resolveServerIPs('ns.partial-flaky.test', dependencies),
+        ['192.0.2.53', '2001:db8::53']
+    );
+});
+
 test('deep delegations with CNAME hops are not cut off by a fixed query count', async () => {
     const targets = {
         'www.a.example.com': ['CNAME', 'www.b.example.org'],

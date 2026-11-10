@@ -1447,21 +1447,31 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
 
     const promise = (async () => {
         const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
-        const qTypes = family === 'ANY' ? ['A', 'AAAA'] : [family];
+        const families = family === 'ANY' ? ADDRESS_FAMILIES : [family];
+        // ANY で片方の種別だけがキャッシュ済みなら、それを再利用して欠けている種別だけを解決する
+        const cachedEntries = families.map(type => family === 'ANY'
+            ? getUnexpiredEntry(nameserverIpCache, getNameserverFamilyKey(normalized, gluePolicy, scope, type))
+            : null);
+        const reusedEntries = cachedEntries.every(Boolean) ? [] : cachedEntries.filter(Boolean);
+        const qTypes = families.filter((type, index) => !reusedEntries.includes(cachedEntries[index]));
         const results = await Promise.all(qTypes.map(qType =>
             resolveFromRootDetailed(normalized, qType, dnsResponseCache, childDependencies)));
         const recordsByType = results.map(result => result.records.filter(isIpLiteral));
-        const ips = recordsByType.flat();
+        const ips = families.flatMap((type, index) => reusedEntries.includes(cachedEntries[index])
+            ? cachedEntries[index].ips
+            : recordsByType[qTypes.indexOf(type)]);
         const allowedIps = filterAllowedAddresses(ips, dependencies);
         if (ips.length > 0) {
             // 片方のアドレス種別が予算で打ち切られた結果を、完全な NS アドレス一覧として保存しない。
             if (queryBudget?.exhausted) {
                 return includeBlockedAddresses ? ips : (allowedIps.length > 0 ? allowedIps : null);
             }
-            const ttls = results.map(result => result.ttlSeconds).filter(ttl => ttl !== null);
-            const ttlMs = ttls.length > 0
-                ? Math.min(Math.min(...ttls) * 1000, NAMESERVER_IP_CACHE_TTL)
-                : NAMESERVER_IP_CACHE_TTL;
+            // 再利用したキャッシュの残り時間も含めた最小値を使い、合成した結果をキャッシュの期限より長く固定しない
+            const ttlMs = Math.min(
+                NAMESERVER_IP_CACHE_TTL,
+                ...results.map(result => result.ttlSeconds).filter(ttl => ttl !== null).map(ttl => ttl * 1000),
+                ...reusedEntries.map(entry => entry.expiresAt - Date.now())
+            );
             // 権威応答で確定した種別だけを保存する。一時的な失敗で空になった種別は保存せず、次回に再解決させる
             results.forEach((result, index) => {
                 if (result.definitive) {
