@@ -257,6 +257,13 @@ function normalizeQueryOptions(options, defaults = {}) {
             normalized.queryBudget.remaining < 0)) {
         throw new TypeError('queryBudget.remaining must be a non-negative safe integer');
     }
+    if (normalized.udpTries !== undefined && (!Number.isSafeInteger(normalized.udpTries) || normalized.udpTries < 1)) {
+        throw new TypeError('udpTries must be a positive safe integer');
+    }
+    if (normalized.udpRetryIntervalMs !== undefined &&
+        !(Number.isFinite(normalized.udpRetryIntervalMs) && normalized.udpRetryIntervalMs > 0)) {
+        throw new TypeError('udpRetryIntervalMs must be a positive number');
+    }
     return normalized;
 }
 
@@ -607,7 +614,11 @@ const UDP_QUERY_DEFAULTS = Object.freeze({
     udpPort: DNS_PORT,
     tcpPort: DNS_PORT,
     timeoutMs: 5000,
-    use0x20: true
+    use0x20: true,
+    // dig の +tries=3 と同じ送信回数。再送までの待ち時間は 1 秒から倍々に伸ばし (1 秒 → 2 秒)、
+    // 全体は timeoutMs に収める (既定では 0 秒・1 秒後・3 秒後に送信し、5 秒で打ち切る)
+    udpTries: 3,
+    udpRetryIntervalMs: 1000
 });
 
 // 応答待ちの同一 UDP 問い合わせ (サーバー・名前・タイプ・オプションが同じもの) の合流用。
@@ -616,7 +627,7 @@ const UDP_QUERY_DEFAULTS = Object.freeze({
 const inFlightUdpQueries = new Map();
 
 function getUdpInFlightKey(cacheKey, options) {
-    return `${cacheKey}|udp:${options.udpPayloadSize}|0x20:${options.use0x20 ? 1 : 0}|budget:${getIdentity(options.queryBudget)}`;
+    return `${cacheKey}|udp:${options.udpPayloadSize}|0x20:${options.use0x20 ? 1 : 0}|tries:${options.udpTries},${options.udpRetryIntervalMs}|budget:${getIdentity(options.queryBudget)}`;
 }
 
 export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS', queryOptions = true) {
@@ -715,8 +726,15 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
         let abortHandler = null;
         let caseMismatchSeen = false;
         let lastDecodeError = null;
+        let retransmitTimer = null;
+        let attempts = 0;
+        const startedAt = Date.now();
+        // 再送した場合だけ、結果に送信回数を付ける
+        const attemptInfo = () => (attempts > 1 ? { udpAttempts: attempts } : {});
 
         const closeClient = () => {
+            if (retransmitTimer) clearTimeout(retransmitTimer);
+            retransmitTimer = null;
             if (!client) return;
             try { client.close(); } catch (e) {}
             client = null;
@@ -787,7 +805,10 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
                 return finish(decodeError);
             }
-            const timeoutResult = buildDnsError('TIMEOUT', { domain, serverIp, qType, transport: 'udp', retryable: true });
+            const timeoutResult = {
+                ...buildDnsError('TIMEOUT', { domain, serverIp, qType, transport: 'udp', retryable: true }),
+                ...attemptInfo()
+            };
             setCacheEntry(dnsResponseCache, cacheKey, timeoutResult, DNS_CACHE_TTL.timeout);
             return finish(timeoutResult);
         }, options.timeoutMs);
@@ -856,7 +877,7 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                         ));
                 }
 
-                const udpSuccess = { ...decoded, transport: 'udp' };
+                const udpSuccess = { ...decoded, transport: 'udp', ...attemptInfo() };
                 if (decoded.rcode === 'NOERROR') {
                     setCacheEntry(dnsResponseCache, cacheKey, udpSuccess, computeSuccessTtlMs(decoded));
                 }
@@ -867,6 +888,35 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
                 return finish(decodeError);
             }
+        };
+
+        // パケットロスを無応答と誤認しないよう、応答がなければ同じソケットから同じ問い合わせを再送する。
+        // id・ソースポートは変えないため、遅れて届いた先行分への応答もそのまま受理できる
+        const scheduleRetransmit = () => {
+            if (attempts >= options.udpTries) return;
+            const delayMs = options.udpRetryIntervalMs * 2 ** (attempts - 1);
+            if (Date.now() - startedAt + delayMs >= options.timeoutMs) return;
+            retransmitTimer = setTimeout(() => {
+                retransmitTimer = null;
+                if (settled || !client) return;
+                // 送信予算が尽きた場合は再送せず、送信済みの問い合わせへの応答を待ち続ける
+                if (getQueryLimitError(domain, serverIp, qType, 'udp', options, true)) return;
+                sendQuery();
+            }, delayMs);
+        };
+
+        const sendQuery = () => {
+            const isFirstAttempt = attempts === 0;
+            attempts++;
+            client.send(buf, 0, buf.length, options.udpPort, serverIp, (err) => {
+                // 再送の送信失敗では打ち切らず、送信済みの問い合わせへの応答を待つ
+                if (err && isFirstAttempt) {
+                    const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
+                    setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);
+                    return finish(sendError);
+                }
+            });
+            scheduleRetransmit();
         };
 
         // バインド中のソケットも中断時に即座に閉じられるよう client に保持する
@@ -893,13 +943,7 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
 
                 const queryLimit = getQueryLimitError(domain, serverIp, qType, 'udp', options, true);
                 if (queryLimit) return finish(queryLimit);
-                client.send(buf, 0, buf.length, options.udpPort, serverIp, (err) => {
-                    if (err) {
-                        const sendError = buildDnsError('SEND_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err.message, retryable: true });
-                        setCacheEntry(dnsResponseCache, cacheKey, sendError, DNS_CACHE_TTL.transient);
-                        return finish(sendError);
-                    }
-                });
+                sendQuery();
             })
             .catch((err) => {
                 const socketError = buildDnsError('SOCKET_ERROR', { domain, serverIp, qType, transport: 'udp', detail: err?.message, retryable: true });

@@ -16,7 +16,7 @@ npm install git+https://github.com/yoshigoto/dns-self-resolver.git
 
 ## 主な機能
 
-- `queryDirectlyUDP` / `queryDirectlyTCP`: 指定した DNS サーバーへ直接問い合わせます。EDNS、FORMERR を受けた場合の EDNS なし再試行、UDP 応答が切り詰められた場合の TCP フォールバックに対応しています。
+- `queryDirectlyUDP` / `queryDirectlyTCP`: 指定した DNS サーバーへ直接問い合わせます。EDNS、応答がない場合の UDP 再送、FORMERR を受けた場合の EDNS なし再試行、UDP 応答が切り詰められた場合の TCP フォールバックに対応しています。
 - `resolveRecordFromRoot`: ルートサーバーから委任をたどり、指定したレコードを解決します。CNAME の追跡、サーバー候補の切り替え、問い合わせ予算、キャンセルに対応しています。
 - `resolveServerIPs` / `resolveHostnameIPv4Self` / `resolveHostnameIPv6Self`: ネームサーバー名の IP アドレスを、ルートからたどって解決します。glue がない場合は再帰的に解決します。
 - `resolveRecordFromServer`: 指定した DNS サーバーからレコードを取得します。
@@ -159,6 +159,8 @@ if (isValidReferral(delegatedZone, serverZone, queryName)) {
 | `timeoutMs` | `5000` | 1 回の問い合わせのタイムアウト（ミリ秒）です。 |
 | `signal` | なし | 問い合わせまたは解決処理を中断する `AbortSignal` です。 |
 | `use0x20` | `true` | UDP の質問名の大文字・小文字をランダム化します。 |
+| `udpTries` | `3` | 応答がない場合の再送を含む、UDP の送信回数です。`1` で再送しません。 |
+| `udpRetryIntervalMs` | `1000` | 最初の再送までの待ち時間（ミリ秒）です。再送のたびに 2 倍にします。 |
 | `isAllowedServerIP` | なし | 問い合わせ先 IP アドレスを受け取り、許可する場合に `true` を返す同期関数です。 |
 | `queryBudget` | なし | `createQueryBudget(maxQueries)` で作った、DNS メッセージ送信回数の共有予算です。 |
 
@@ -182,7 +184,7 @@ const response = await queryDirectlyUDP('example.com', addresses[0], cache, 'NS'
 
 同じ検査のすべての問い合わせに同じ予算オブジェクトを渡してください。直接問い合わせと `resolveRecordFromServer` では第 5 引数、ルート・NS 自己解決では `dependencies.queryBudget`（または `dependencies.queryOptions.queryBudget`）に指定します。両方ある場合は前者を優先します。入れ子の NS 解決、EDNS / 0x20 再試行、TCP フォールバックにも引き継ぎます。差し替えた問い合わせ関数は、受け取った `queryBudget` と `signal` を実トランスポートへ渡す必要があります。
 
-UDP の `send` / TCP の DNS メッセージ `write` の直前に `remaining` を 1 減らします。UDP と TCP の取得はそれぞれ 1 回、A と AAAA も別々に数えます。送信処理に渡した後の失敗では予算を戻しません。バイト数、TCP 接続のハンドシェイク、OS による TCP 再送の回数は数えません。キャッシュ利用、送信前のキャンセル・宛先拒否・入力不備では減らしません。
+UDP の `send` / TCP の DNS メッセージ `write` の直前に `remaining` を 1 減らします。UDP と TCP の取得はそれぞれ 1 回、UDP の再送も 1 回ずつ、A と AAAA も別々に数えます。送信処理に渡した後の失敗では予算を戻しません。バイト数、TCP 接続のハンドシェイク、OS による TCP 再送の回数は数えません。キャッシュ利用、送信前のキャンセル・宛先拒否・入力不備では減らしません。
 
 同じ予算の並行 UDP 問い合わせは合流して 1 送信として数えます。異なる予算間では問い合わせと NS 自己解決の合流を分離し、片方の検査がもう片方の予算を消費しないようにします。完了した応答キャッシュは予算が異なっていても再利用できます。
 
@@ -231,6 +233,16 @@ const addresses = await resolveServerIPs('ns.example.com', {
 ```
 
 `error` には `TIMEOUT`、`ABORTED`、`QUERY_LIMIT_EXCEEDED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。TCP で応答を受け取る前に接続が閉じられた場合は、タイムアウトを待たずに `SOCKET_ERROR`（`retryable: true`）を返します。
+
+### UDP の再送
+
+UDP で応答がない場合は、パケットロスを無応答と誤認しないよう、同じ問い合わせを再送します。送信回数は dig の `+tries=3` に合わせた 3 回で、待ち時間は 1 秒、2 秒と倍々に伸ばします。全体は `timeoutMs` に収めるため、既定値では 0 秒・1 秒後・3 秒後に送信し、5 秒で `TIMEOUT` になります（待ち時間は 1 秒 → 2 秒 → 2 秒）。1 回の問い合わせにかかる最大時間は再送の導入前と変わりません。
+
+- 再送は同じソケットから同じトランザクション ID・同じ質問名（0x20 の大文字・小文字も同じ）で送ります。遅れて届いた先行分への応答もそのまま受理します。
+- `timeoutMs` までに送れない再送は行いません（例: `timeoutMs: 2000` では 0 秒と 1 秒後の 2 回）。
+- 再送も `queryBudget` を 1 ずつ消費します。予算が尽きた場合は再送せず、送信済みの問い合わせへの応答を待ちます。
+- 再送した場合は、結果（成功・`TIMEOUT`）に送信回数 `udpAttempts` が付きます。1 回で応答があった場合は付きません。
+- TCP には再送はありません（OS の TCP 再送に任せます）。
 
 UDP では、不正なデータグラムを受け取っても問い合わせを打ち切らず、正しい応答を待ちます。送信元・トランザクション ID・QR ビットの検証を通過した応答でデコードに失敗し、その後も正しい応答が届かずタイムアウトした場合は `DECODE_ERROR` を返します（大文字・小文字の不一致による 0x20 なし再試行の条件も満たす場合は、再試行を優先します）。送信元や ID が一致しない応答だけを受け取った場合は `TIMEOUT` を返します。UDP から TCP へのフォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。このエラー形式には `retryFrom: 'udp-truncated'` と `isFallback: true` が含まれます。
 
