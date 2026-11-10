@@ -74,6 +74,30 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 
 `queryOptions.timeoutMs` は 1 回の問い合わせのタイムアウトです。解決処理全体を中断するには `signal` を指定してください。中断すると進行中のソケットを閉じ、後続サーバーへの再試行も停止します。`Promise.race` だけでは、タイムアウト後も内部の問い合わせが続くことがあります。
 
+### ルートサーバーの選択
+
+解決の起点には、組み込みのルートヒント（a〜m の 13 サーバーの IPv4 / IPv6 アドレス。`ROOT_SERVERS`、`ROOT_SERVER_IPS`、`ROOT_SERVER_IPV6_ADDRESSES`）を使います。一般的なフルサービスリゾルバと同様に、特定のサーバーへ問い合わせを集中させません。
+
+- 解決のたび（CNAME をたどってルートからやり直すときも含む）に、全アドレスを無作為な順に並べて先頭から試します。
+- IPv6 のルートサーバーは、ホストがグローバル IPv6 アドレスを持つ場合にだけ候補に含めます。
+- タイムアウト・送信失敗・エラー応答（`REFUSED`、`SERVFAIL` など）になったルートサーバーは、`ROOT_SERVER_FAILURE_BACKOFF_MS`（既定 60 秒）の間、候補の末尾に回します。
+
+ルートヒントは固定値で、priming（`. NS` の問い合わせによる更新）や応答時間に基づく選択は行いません。
+
+独自のルートや、決まった順序が必要なテストでは、アドレス一覧を指定できます。指定した場合は並べ替えず、その順序のまま試します。
+
+```js
+import { ROOT_SERVER_IPS, resolveRecordFromRoot, setDefaultRootServers } from 'dns-self-resolver';
+
+// 解決ごとに指定する
+await resolveRecordFromRoot('example.com', 'A', cache, { rootServers: ['198.41.0.4'] });
+
+// プロセス全体の既定値を差し替える (null で組み込みのルートヒントに戻す)
+setDefaultRootServers(ROOT_SERVER_IPS);
+```
+
+`dependencies.rootServers` は `setDefaultRootServers` より優先します。IP アドレスリテラル以外を含む一覧や空の一覧は `TypeError` になります。`ROOT_SERVER_BOOTSTRAP_IP`（a.root-servers.net の IPv4 アドレス）は互換性のために残していますが、解決の起点として固定では使いません。
+
 ### glue の利用方針
 
 `resolveRecordFromRoot` の `dependencies.gluePolicy` で glue の利用方針を指定できます。

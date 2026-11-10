@@ -6,8 +6,13 @@ import {
     isSubdomainOrEqual,
     normalizeDnsName,
     resolveRecordFromRoot,
-    ROOT_SERVER_BOOTSTRAP_IP
+    ROOT_SERVER_BOOTSTRAP_IP,
+    ROOT_SERVER_IPS,
+    setDefaultRootServers
 } from '../index.js';
+
+// モックが a.root-servers.net から順に試す前提のため、ルートサーバーの無作為選択を固定する
+setDefaultRootServers(ROOT_SERVER_IPS);
 
 const additionals = [
     { name: 'NS.External.NET.', type: 'A', data: '192.0.2.1' },

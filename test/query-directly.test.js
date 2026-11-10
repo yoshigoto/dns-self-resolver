@@ -24,8 +24,13 @@ import {
     getKnownAddress,
     getCachedNameserverIPs,
     RESOLUTION_LIMITS,
-    ROOT_SERVER_BOOTSTRAP_IP
+    ROOT_SERVER_BOOTSTRAP_IP,
+    ROOT_SERVER_IPS,
+    setDefaultRootServers
 } from '../index.js';
+
+// モックが a.root-servers.net から順に試す前提のため、ルートサーバーの無作為選択を固定する
+setDefaultRootServers(ROOT_SERVER_IPS);
 
 function createDnsResponse(query, flags = 0) {
     return dnsPacket.encode({

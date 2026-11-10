@@ -8,8 +8,12 @@ import {
     resolveHostnameIPv4Self,
     resolveRecordFromRoot,
     resolveServerIPs,
-    ROOT_SERVER_IPS
+    ROOT_SERVER_IPS,
+    setDefaultRootServers
 } from '../index.js';
+
+// モックが a.root-servers.net から順に試す前提のため、ルートサーバーの無作為選択を固定する
+setDefaultRootServers(ROOT_SERVER_IPS);
 
 const AA = dnsPacket.AUTHORITATIVE_ANSWER;
 const answer = (type, name, data) => ({
