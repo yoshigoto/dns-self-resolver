@@ -13,8 +13,13 @@ import {
     resolveHostnameIPv6Self,
     resolveRecordFromRoot,
     resolveServerIPs,
-    ROOT_SERVER_BOOTSTRAP_IP
+    ROOT_SERVER_BOOTSTRAP_IP,
+    ROOT_SERVER_IPS,
+    setDefaultRootServers
 } from '../index.js';
+
+// モックが a.root-servers.net から順に試す前提のため、ルートサーバーの無作為選択を固定する
+setDefaultRootServers(ROOT_SERVER_IPS);
 
 test('public DNS address policy rejects special-purpose and scoped addresses', () => {
     for (const address of ['198.41.0.4', '8.8.8.8', '2001:500:2::c', '2a00:1450:4001::1']) {

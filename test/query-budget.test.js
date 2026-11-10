@@ -6,8 +6,13 @@ import test from 'node:test';
 import dnsPacket from 'dns-packet';
 import {
     createQueryBudget, queryDirectlyUDP, queryDirectlyTCP,
-    resolveRecordFromRoot, resolveRecordFromServer, resolveServerIPs
+    resolveRecordFromRoot, resolveRecordFromServer, resolveServerIPs,
+    ROOT_SERVER_IPS,
+    setDefaultRootServers
 } from '../index.js';
+
+// モックが a.root-servers.net から順に試す前提のため、ルートサーバーの無作為選択を固定する
+setDefaultRootServers(ROOT_SERVER_IPS);
 
 const serverIp = '127.0.0.1';
 const defaults = { use0x20: false, timeoutMs: 50 };

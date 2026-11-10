@@ -4,6 +4,7 @@
 // dns-delegation-check / dnssec-validator など、DNS を自前で辿るツール間で重複していたロジックを集約したもの。
 
 import net from 'net';
+import os from 'os';
 import dgram from 'dgram';
 import { randomBytes, randomInt } from 'crypto';
 import dnsPacket from 'dns-packet';
@@ -888,23 +889,94 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
     });
 }
 
-// a.root-servers.net の固定 IP。ここだけは OS/フルサービスリゾルバに頼らずに自己解決を開始するための起点。
-export const ROOT_SERVER_BOOTSTRAP_IP = '198.41.0.4';
-export const ROOT_SERVER_IPS = [
-    ROOT_SERVER_BOOTSTRAP_IP,
-    '199.9.14.201',
-    '192.33.4.12',
-    '199.7.91.13',
-    '192.203.230.10',
-    '192.5.5.241',
-    '192.112.36.4',
-    '198.97.190.53',
-    '192.36.148.17',
-    '192.58.128.30',
-    '193.0.14.129',
-    '199.7.83.42',
-    '202.12.27.33'
-];
+// ルートヒント (https://www.internic.net/domain/named.root)。ここだけは OS/フルサービスリゾルバに頼らずに
+// 自己解決を開始するための起点として固定で持つ。
+export const ROOT_SERVERS = Object.freeze([
+    ['a', '198.41.0.4', '2001:503:ba3e::2:30'],
+    ['b', '170.247.170.2', '2801:1b8:10::b'],
+    ['c', '192.33.4.12', '2001:500:2::c'],
+    ['d', '199.7.91.13', '2001:500:2d::d'],
+    ['e', '192.203.230.10', '2001:500:a8::e'],
+    ['f', '192.5.5.241', '2001:500:2f::f'],
+    ['g', '192.112.36.4', '2001:500:12::d0d'],
+    ['h', '198.97.190.53', '2001:500:1::53'],
+    ['i', '192.36.148.17', '2001:7fe::53'],
+    ['j', '192.58.128.30', '2001:503:c27::2:30'],
+    ['k', '193.0.14.129', '2001:7fd::1'],
+    ['l', '199.7.83.42', '2001:500:9f::42'],
+    ['m', '202.12.27.33', '2001:dc3::35']
+].map(([letter, ipv4, ipv6]) => Object.freeze({ name: `${letter}.root-servers.net`, ipv4, ipv6 })));
+export const ROOT_SERVER_IPS = ROOT_SERVERS.map(server => server.ipv4);
+export const ROOT_SERVER_IPV6_ADDRESSES = ROOT_SERVERS.map(server => server.ipv6);
+// a.root-servers.net の IPv4 アドレス。呼び出し側が固定の起点を必要とする場合に使う。
+export const ROOT_SERVER_BOOTSTRAP_IP = ROOT_SERVERS[0].ipv4;
+// 応答しなかったルートサーバーを後回しにする期間
+export const ROOT_SERVER_FAILURE_BACKOFF_MS = 60000;
+
+const ROOT_SERVER_ADDRESSES = new Set([...ROOT_SERVER_IPS, ...ROOT_SERVER_IPV6_ADDRESSES]);
+const rootServerFailures = new Map(); // ルートサーバーのアドレス -> 後回しにする期限
+
+function hasGlobalIPv6Address() {
+    try {
+        return Object.values(os.networkInterfaces()).flat().some(entry =>
+            entry && !entry.internal && (entry.family === 'IPv6' || entry.family === 6) &&
+            GLOBAL_UNICAST_IPV6.check(String(entry.address).split('%')[0], 'ipv6'));
+    } catch {
+        return false;
+    }
+}
+
+function shuffle(items) {
+    const shuffled = [...items];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = randomInt(0, i + 1);
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+}
+
+function validateRootServers(rootServers) {
+    // every() は疎配列の空スロットを飛ばすため、密な配列に直してから検証する
+    const list = Array.isArray(rootServers) ? Array.from(rootServers) : [];
+    if (list.length === 0 || !list.every(isIpLiteral)) {
+        throw new TypeError('rootServers must be a non-empty array of IPv4/IPv6 address literals');
+    }
+    return list;
+}
+
+let defaultRootServers = null;
+
+// 組み込みのルートヒントの代わりに使うアドレス一覧をプロセス全体に設定する (独自ルートやテスト用)。
+// 指定した順序のまま試す。null を渡すと組み込みのルートヒントに戻す。
+export function setDefaultRootServers(rootServers) {
+    defaultRootServers = rootServers === null ? null : validateRootServers(rootServers);
+}
+
+function getRootServerOverride(dependencies) {
+    const rootServers = dependencies?.rootServers;
+    return rootServers === undefined ? defaultRootServers : validateRootServers(rootServers);
+}
+
+// 一般的なフルサービスリゾルバと同様に、特定のルートサーバーへ問い合わせを集中させない。
+// IPv4 / IPv6 の全ルートヒントから無作為な順に試し (IPv6 はホストがグローバル IPv6 アドレスを持つ場合のみ)、
+// 直近に応答しなかったサーバーは後回しにする。
+// dependencies.rootServers または setDefaultRootServers の指定時は、その順序のまま使う。
+function getRootServerCandidates(dependencies) {
+    const override = getRootServerOverride(dependencies);
+    if (override) return override.map(ip => ({ ip, zone: '.' }));
+    const now = Date.now();
+    const isBackedOff = ip => rootServerFailures.get(ip) > now;
+    const ips = shuffle([...ROOT_SERVER_IPS, ...(hasGlobalIPv6Address() ? ROOT_SERVER_IPV6_ADDRESSES : [])]);
+    return [...ips.filter(ip => !isBackedOff(ip)), ...ips.filter(isBackedOff)]
+        .map(ip => ({ ip, zone: '.' }));
+}
+
+function recordRootServerResult(ip, failed) {
+    if (!ROOT_SERVER_ADDRESSES.has(ip)) return;
+    if (failed) rootServerFailures.set(ip, Date.now() + ROOT_SERVER_FAILURE_BACKOFF_MS);
+    else rootServerFailures.delete(ip);
+}
+
 export const NAMESERVER_IP_CACHE_TTL = 300000; // NS アドレスキャッシュの上限 (レコードに TTL が無い場合のフォールバック)
 // 自己解決に失敗した NS 名の短時間ネガティブキャッシュ (同じ失敗する名前への再問い合わせ増幅を防ぐ)
 export const NAMESERVER_NEGATIVE_CACHE_TTL = 5000;
@@ -950,7 +1022,9 @@ function getCacheScope(dependencies) {
     if (typeof dependencies === 'string') return dependencies;
     if (!dependencies) return `default|udp:${DNS_PORT},tcp:${DNS_PORT}`;
     const queryOptions = dependencies.queryOptions || {};
-    const portScope = `udp:${queryOptions.udpPort ?? DNS_PORT},tcp:${queryOptions.tcpPort ?? DNS_PORT}`;
+    const rootServers = getRootServerOverride(dependencies);
+    const portScope = `udp:${queryOptions.udpPort ?? DNS_PORT},tcp:${queryOptions.tcpPort ?? DNS_PORT}` +
+        (rootServers ? `|roots:${rootServers.join(',')}` : '');
     const parts = [
         dependencies.knownAddresses,
         dependencies.queryDirectlyUDP,
@@ -1191,9 +1265,16 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
     });
 
     let queryName = normalizeDnsName(name);
-    let currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
-    let currentServerZone = '.';
-    let candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip, zone: '.' }));
+    let currentServerIp;
+    let currentServerZone;
+    let candidateQueue;
+    const restartFromRoot = () => {
+        const [first, ...rest] = getRootServerCandidates(dependencies);
+        currentServerIp = first.ip;
+        currentServerZone = first.zone;
+        candidateQueue = rest;
+    };
+    restartFromRoot();
     const visitedNames = new Set([queryName]);
 
     const resolveNsAddress = async (nsName) => {
@@ -1251,6 +1332,17 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             budget.limitHits++;
             return done([]);
         }
+        const isErrorRcode = !res?.error && res?.rcode !== undefined &&
+            res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
+        // 宛先拒否など、サーバーの到達性と無関係な失敗では後回しの状態を変えない。
+        // キャッシュから復元した結果も今回の到達性の観測ではないため対象外とする
+        if (currentServerZone === '.' && res && res.isCached !== true) {
+            if (isErrorRcode || ['TIMEOUT', 'SOCKET_ERROR', 'SEND_ERROR'].includes(res.error)) {
+                recordRootServerResult(currentServerIp, true);
+            } else if (!res.error) {
+                recordRootServerResult(currentServerIp, false);
+            }
+        }
         if (!res || res.error) {
             if (await useNextCandidate()) continue;
             return done([]);
@@ -1258,7 +1350,6 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
 
         // REFUSED / SERVFAIL などのエラー応答は AA 付きでも不在の証明にならず、含まれるレコードも信用できないため、
         // 応答や CNAME を処理する前に次の候補を試す
-        const isErrorRcode = res.rcode !== undefined && res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
         if (isErrorRcode) {
             if (await useNextCandidate()) continue;
             return done([]);
@@ -1284,9 +1375,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             visitedNames.add(cnameTarget);
             referralDepth = 0;
             queryName = cnameTarget;
-            currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
-            currentServerZone = '.';
-            candidateQueue = ROOT_SERVER_IPS.slice(1).map(ip => ({ ip, zone: '.' }));
+            restartFromRoot();
             continue;
         }
 
