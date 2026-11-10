@@ -152,6 +152,28 @@ test('an AA-flagged error response falls through to the next server', async () =
     assert.deepEqual(asked, ROOT_SERVER_IPS.slice(0, 2));
 });
 
+test('records in an error response are ignored and the next server is tried', async () => {
+    const errorAnswers = [
+        { type: 'CNAME', name: 'error-records.test', ttl: 300, data: 'stale-target.test' },
+        { type: 'A', name: 'error-records.test', ttl: 300, data: '192.0.2.66' }
+    ];
+    for (const errorAnswer of errorAnswers) {
+        const queryDirectlyUDP = async (name, serverIp) => {
+            if (serverIp === ROOT_SERVER_IPS[0]) {
+                return { flags: AA, rcode: 'SERVFAIL', answers: [errorAnswer], authorities: [], additionals: [] };
+            }
+            return name === 'error-records.test'
+                ? answer('A', name, '192.0.2.7')
+                : { flags: AA, rcode: 'NOERROR', answers: [], authorities: [], additionals: [] };
+        };
+
+        assert.deepEqual(
+            await resolveRecordFromRoot('error-records.test', 'A', new Map(), { queryDirectlyUDP }),
+            ['192.0.2.7']
+        );
+    }
+});
+
 test('TCP: a connection closed without a response fails without waiting for the timeout', async () => {
     const server = net.createServer((socket) => {
         socket.on('error', () => {});

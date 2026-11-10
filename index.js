@@ -1256,6 +1256,14 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             return done([]);
         }
 
+        // REFUSED / SERVFAIL などのエラー応答は AA 付きでも不在の証明にならず、含まれるレコードも信用できないため、
+        // 応答や CNAME を処理する前に次の候補を試す
+        const isErrorRcode = res.rcode !== undefined && res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
+        if (isErrorRcode) {
+            if (await useNextCandidate()) continue;
+            return done([]);
+        }
+
         const matchedAnswers = (res.answers || [])
             .filter(record => record.type === qType && normalizeDnsName(record.name) === queryName);
         if (matchedAnswers.length > 0) {
@@ -1282,12 +1290,6 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             continue;
         }
 
-        // AA 付きでも REFUSED / SERVFAIL などのエラー応答は不在の証明にならないため、次の候補を試す
-        const isErrorRcode = res.rcode !== undefined && res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
-        if (isErrorRcode) {
-            if (await useNextCandidate()) continue;
-            return done([]);
-        }
         if ((res.flags & dnsPacket.AUTHORITATIVE_ANSWER) !== 0) {
             return done([], true); // 権威応答だが対象レコードが無い (NODATA/NXDOMAIN)
         }
