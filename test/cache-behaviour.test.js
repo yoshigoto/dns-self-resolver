@@ -6,7 +6,10 @@ import dnsPacket from 'dns-packet';
 
 import {
     createDnsResponseCache,
+    getCachedNameserverIPs,
     queryDirectlyUDP,
+    resolveHostnameIPv4Self,
+    resolveHostnameIPv6Self,
     resolveServerIPs,
     setCacheEntry
 } from '../index.js';
@@ -140,4 +143,133 @@ test('cacheScope shares the nameserver address cache between wrapper functions',
     assert.equal(queries, 4);
 
     await assert.rejects(resolve('ns.scoped.test', { cacheScope: '' }), TypeError);
+});
+
+test('NXDOMAIN responses with an SOA are cached for at most the SOA TTL and MINIMUM', async (t) => {
+    const soa = {
+        name: 'example.test', type: 'SOA', ttl: 20,
+        data: { mname: 'ns.example.test', rname: 'hostmaster.example.test', serial: 1, refresh: 3600, retry: 600, expire: 86400, minimum: 10 }
+    };
+    const responses = {
+        'missing.example.test': { flags: 3, authorities: [soa] },
+        'no-soa.example.test': { flags: 3 },
+        'servfail.example.test': { flags: 2 }
+    };
+    const udp = await startUdpServer(t, query => ({
+        type: 'response', id: query.id, questions: query.questions,
+        ...responses[query.questions[0].name.toLowerCase()]
+    }));
+    const cache = new Map();
+    const options = { udpPort: udp.port, timeoutMs: 1000 };
+    const ask = name => queryDirectlyUDP(name, serverIp, cache, 'A', options);
+
+    assert.equal((await ask('missing.example.test')).rcode, 'NXDOMAIN');
+    const cached = await ask('missing.example.test');
+    assert.equal(cached.rcode, 'NXDOMAIN');
+    assert.equal(cached.isCached, true);
+    assert.equal(udp.queries, 1);
+    const [entry] = [...cache.values()];
+    const remainingMs = entry.expiresAt - Date.now();
+    assert.ok(remainingMs > 5000 && remainingMs <= 10000, `remaining ${remainingMs} ms`);
+
+    // SOA の無い NXDOMAIN と SERVFAIL はキャッシュしない
+    for (const name of ['no-soa.example.test', 'servfail.example.test']) {
+        await ask(name);
+        assert.equal((await ask(name)).isCached, undefined, name);
+    }
+    assert.equal(udp.queries, 5);
+});
+
+test('a failed nameserver resolution is recorded in the address cache and reused by every entry point', async () => {
+    let queries = 0;
+    const dependencies = {
+        queryDirectlyUDP: async () => {
+            queries++;
+            return { error: 'TIMEOUT', retryable: true };
+        },
+        dnsResponseCache: new Map()
+    };
+
+    assert.equal(await resolveServerIPs('ns.unreachable.test', dependencies), null);
+    const queriesAfterFailure = queries;
+    assert.ok(queriesAfterFailure > 0);
+    assert.equal(await resolveHostnameIPv4Self('ns.unreachable.test', dependencies), null);
+    assert.equal(await resolveHostnameIPv6Self('ns.unreachable.test', dependencies), null);
+    assert.equal(await resolveServerIPs('ns.unreachable.test', dependencies), null);
+    assert.equal(queries, queriesAfterFailure);
+});
+
+test('an authoritative NODATA learned while resolving both families answers a later single-family lookup', async () => {
+    let queries = 0;
+    const dependencies = {
+        queryDirectlyUDP: async (name, ip, cache, qType) => {
+            queries++;
+            return {
+                flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                rcode: 'NOERROR',
+                answers: qType === 'AAAA' ? [{ type: 'AAAA', name, ttl: 300, data: '2001:db8::53' }] : []
+            };
+        },
+        dnsResponseCache: new Map()
+    };
+
+    assert.deepEqual(await resolveServerIPs('ns.v6-only.test', dependencies), ['2001:db8::53']);
+    const queriesAfterResolution = queries;
+    assert.equal(await resolveHostnameIPv4Self('ns.v6-only.test', dependencies), null);
+    assert.equal(queries, queriesAfterResolution);
+});
+
+test('a recorded failure of one family is not treated as a complete address list', async () => {
+    let failAaaa = true;
+    const dependencies = {
+        queryDirectlyUDP: async (name, ip, cache, qType) => (qType === 'AAAA' && failAaaa)
+            ? { error: 'TIMEOUT', retryable: true }
+            : {
+                flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                rcode: 'NOERROR',
+                answers: [{ type: qType, name, ttl: 300, data: qType === 'A' ? '192.0.2.53' : '2001:db8::53' }]
+            },
+        dnsResponseCache: new Map()
+    };
+
+    assert.equal(await resolveHostnameIPv6Self('ns.partial-failure.test', dependencies), null);
+    assert.equal(await resolveHostnameIPv4Self('ns.partial-failure.test', dependencies), '192.0.2.53');
+    assert.equal(getCachedNameserverIPs('ns.partial-failure.test', 'strict', dependencies), null);
+    failAaaa = false;
+    assert.deepEqual(
+        await resolveServerIPs('ns.partial-failure.test', dependencies),
+        ['192.0.2.53', '2001:db8::53']
+    );
+});
+
+test('a late failure does not overwrite an address cached by a concurrent successful resolution', async () => {
+    let failing = true;
+    let queries = 0;
+    const dependencies = {
+        rootServers: ['192.0.2.1'],
+        dnsResponseCache: new Map(),
+        queryDirectlyUDP: async (name, ip, cache, qType) => {
+            queries++;
+            if (failing) {
+                await new Promise(resolve => setTimeout(resolve, 30));
+                return { error: 'TIMEOUT', retryable: true };
+            }
+            return {
+                flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                rcode: 'NOERROR',
+                answers: [{ type: qType, name, ttl: 300, data: qType === 'A' ? '192.0.2.53' : '2001:db8::53' }]
+            };
+        }
+    };
+
+    // A / AAAA 両方の解決が遅れて失敗する間に、IPv4 のみの解決が成功する
+    const slowFailure = resolveServerIPs('ns.race.test', dependencies);
+    await new Promise(resolve => setImmediate(resolve));
+    failing = false;
+    assert.equal(await resolveHostnameIPv4Self('ns.race.test', dependencies), '192.0.2.53');
+    assert.equal(await slowFailure, null);
+
+    const queriesAfterRace = queries;
+    assert.equal(await resolveHostnameIPv4Self('ns.race.test', dependencies), '192.0.2.53');
+    assert.equal(queries, queriesAfterRace);
 });

@@ -148,7 +148,8 @@ export const DNS_CACHE_TTL = {
     timeout: 2000
 };
 
-// レコード TTL (秒) と上限 (ms) の小さい方をキャッシュ期間として採用する
+// レコード TTL (秒) と上限 (ms) の小さい方をキャッシュ期間として採用する。
+// 否定応答 (NXDOMAIN / NODATA) は RFC 2308 に従い、AUTHORITY の SOA の TTL と MINIMUM の小さい方も上限にする
 function computeSuccessTtlMs(decoded, capMs = DNS_CACHE_TTL.success) {
     let minTtlSeconds = Infinity;
     for (const section of [decoded?.answers, decoded?.authorities]) {
@@ -156,11 +157,22 @@ function computeSuccessTtlMs(decoded, capMs = DNS_CACHE_TTL.success) {
             if (typeof record.ttl === 'number' && record.ttl >= 0) {
                 minTtlSeconds = Math.min(minTtlSeconds, record.ttl);
             }
+            const soaMinimum = section === decoded.authorities && record.type === 'SOA' ? record.data?.minimum : undefined;
+            if (typeof soaMinimum === 'number' && soaMinimum >= 0) {
+                minTtlSeconds = Math.min(minTtlSeconds, soaMinimum);
+            }
         }
     }
     return minTtlSeconds === Infinity
         ? capMs
         : Math.min(minTtlSeconds * 1000, capMs);
+}
+
+// NOERROR に加えて NXDOMAIN もキャッシュする。SOA の無い NXDOMAIN は保持期間を決められないためキャッシュしない (RFC 2308)。
+// SERVFAIL / REFUSED などはサーバー側の一時的な状態であり得るためキャッシュしない
+function isCacheableResponse(decoded) {
+    if (decoded.rcode === 'NOERROR') return true;
+    return decoded.rcode === 'NXDOMAIN' && (decoded.authorities || []).some(record => record.type === 'SOA');
 }
 
 function buildDnsError(code, { domain, serverIp, qType, transport, detail, retryable }) {
@@ -590,7 +602,7 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                         }
 
                         const tcpSuccess = { ...decoded, transport: 'tcp' };
-                        if (decoded.rcode === 'NOERROR') {
+                        if (isCacheableResponse(decoded)) {
                             setCacheEntry(dnsResponseCache, cacheKey, tcpSuccess, computeSuccessTtlMs(decoded));
                         }
                         return finish(tcpSuccess);
@@ -887,7 +899,7 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 }
 
                 const udpSuccess = { ...decoded, transport: 'udp', ...attemptInfo() };
-                if (decoded.rcode === 'NOERROR') {
+                if (isCacheableResponse(decoded)) {
                     setCacheEntry(dnsResponseCache, cacheKey, udpSuccess, computeSuccessTtlMs(decoded));
                 }
 
@@ -1076,11 +1088,11 @@ export const RESOLUTION_LIMITS = Object.freeze({
     maxCnameChain: 8
 });
 
-// スコープ・正規化ホスト名・gluePolicy・アドレス種別 (A / AAAA) -> { ips, expiresAt }
-// 種別ごとに保持し、片方しか解決していない結果を完全な一覧として返さないようにする (ips は空配列もあり得る)
+// スコープ・正規化ホスト名・gluePolicy・アドレス種別 (A / AAAA) -> { ips, failed, expiresAt }
+// 種別ごとに保持し、片方しか解決していない結果を完全な一覧として返さないようにする (ips は空配列もあり得る)。
+// 解決に失敗した名前の短時間の記録 (failed: true) も同じキャッシュに持つ
 const nameserverIpCache = new Map();
 const ADDRESS_FAMILIES = ['A', 'AAAA'];
-const nameserverNegativeCache = new Map(); // スコープ・正規化ホスト名・gluePolicy・family -> { expiresAt }
 // 同一ホスト名・ポリシー・アドレス種別 (A / AAAA / ANY) の並行解決合流用 (Singleflight)
 const inFlightNameserverResolutions = new Map();
 
@@ -1174,25 +1186,38 @@ function getNameserverFamilyKey(hostname, gluePolicy, scope, family) {
     return `${getNameserverResolutionKey(hostname, gluePolicy, scope)}|${family}`;
 }
 
-// 指定した種別がすべてキャッシュ済みの場合だけ、それらを合わせたアドレス一覧を返す
+function getFamilyCacheEntry(hostname, gluePolicy, scope, family) {
+    return getUnexpiredEntry(nameserverIpCache, getNameserverFamilyKey(hostname, gluePolicy, scope, family));
+}
+
+// 指定した種別がすべて (権威応答で確定した結果として) キャッシュ済みの場合だけ、それらを合わせたアドレス一覧を返す。
+// 解決失敗の記録 (failed) は確定した結果ではないため、ここでは未キャッシュとして扱う
 function getCachedFamilyIPs(hostname, gluePolicy, scope, families) {
     const ips = [];
     for (const family of families) {
-        const entry = getUnexpiredEntry(nameserverIpCache, getNameserverFamilyKey(hostname, gluePolicy, scope, family));
-        if (!entry) return null;
+        const entry = getFamilyCacheEntry(hostname, gluePolicy, scope, family);
+        if (!entry || entry.failed) return null;
         ips.push(...entry.ips);
     }
     return ips;
 }
 
-function cacheFamilyIPs(hostname, family, ips, ttlMs, gluePolicy, scope) {
+function cacheFamilyIPs(hostname, family, ips, ttlMs, gluePolicy, scope, failed = false) {
     if (!(ttlMs > 0)) return;
     setBounded(
         nameserverIpCache,
         getNameserverFamilyKey(hostname, gluePolicy, scope, family),
-        { ips, expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
+        { ips, failed, expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
         NAMESERVER_CACHE_MAX_ENTRIES
     );
+}
+
+// 確定的な解決失敗を短時間だけ記録する (同じ失敗する名前への再問い合わせ増幅を防ぐ)。
+// 並行する別の解決が権威応答で得た結果を先に保存している場合は、それを失敗の記録で上書きしない
+function cacheFamilyFailure(hostname, family, gluePolicy, scope) {
+    const existing = getFamilyCacheEntry(hostname, gluePolicy, scope, family);
+    if (existing && !existing.failed) return;
+    cacheFamilyIPs(hostname, family, [], NAMESERVER_NEGATIVE_CACHE_TTL, gluePolicy, scope, true);
 }
 
 export function getCachedNameserverIPs(hostname, gluePolicy = 'strict', dependencies = {}) {
@@ -1219,24 +1244,6 @@ export function cacheNameserverIPs(
         const familyIps = validIps.filter(ip => isIPv6(ip) === (family === 'AAAA'));
         cacheFamilyIPs(hostname, family, familyIps, ttlMs, gluePolicy, scope);
     }
-}
-
-function getNegativeCacheKey(hostname, gluePolicy, scope, family) {
-    return `${getNameserverResolutionKey(hostname, gluePolicy, scope)}|${family}`;
-}
-
-function isNegativelyCached(hostname, gluePolicy, scope, family) {
-    return getUnexpiredEntry(nameserverNegativeCache, getNegativeCacheKey(hostname, gluePolicy, scope, family)) !== null;
-}
-
-function cacheNegativeResult(hostname, gluePolicy, scope, family, ttlMs = NAMESERVER_NEGATIVE_CACHE_TTL) {
-    if (!(ttlMs > 0)) return;
-    setBounded(
-        nameserverNegativeCache,
-        getNegativeCacheKey(hostname, gluePolicy, scope, family),
-        { expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
-        NAMESERVER_CACHE_MAX_ENTRIES
-    );
 }
 
 export function getKnownAddress(knownAddresses, hostname, family = 'any') {
@@ -1605,9 +1612,15 @@ async function resolveNameserverAddresses(normalized, dependencies, family) {
         markLimitHit(dependencies);
         return null; // glue なし NS 名の入れ子が深すぎる (NXNS 型の増幅対策)
     }
-    if (isNegativelyCached(normalized, gluePolicy, scope, family)) return null;
-
+    const families = family === 'ANY' ? ADDRESS_FAMILIES : [family];
     const includeBlockedAddresses = family === 'ANY' && dependencies.includeBlockedAddresses === true;
+    // 必要な種別がすべてキャッシュ済み (解決失敗の記録を含む) で、使えるアドレスが 1 つもなければ再解決しない
+    const knownEntries = families.map(type => getFamilyCacheEntry(normalized, gluePolicy, scope, type));
+    if (knownEntries.every(Boolean)) {
+        const knownIps = knownEntries.flatMap(entry => entry.ips);
+        const usableIps = includeBlockedAddresses ? knownIps : filterAllowedAddresses(knownIps, dependencies);
+        if (usableIps.length === 0) return null;
+    }
     const queryBudget = dependencies.queryBudget ?? dependencies.queryOptions?.queryBudget;
     const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}|includeBlocked:${includeBlockedAddresses ? 1 : 0}|budget:${getIdentity(queryBudget)}`;
     const shareInFlight = !dependencies.signal && !dependencies.queryOptions?.signal;
@@ -1628,11 +1641,11 @@ async function resolveNameserverAddresses(normalized, dependencies, family) {
 
     const promise = (async () => {
         const dnsResponseCache = dependencies.dnsResponseCache || dependencies.cache || new Map();
-        const families = family === 'ANY' ? ADDRESS_FAMILIES : [family];
         // ANY で片方の種別だけがキャッシュ済みなら、それを再利用して欠けている種別だけを解決する
-        const cachedEntries = families.map(type => family === 'ANY'
-            ? getUnexpiredEntry(nameserverIpCache, getNameserverFamilyKey(normalized, gluePolicy, scope, type))
-            : null);
+        const cachedEntries = families.map((type) => {
+            const entry = family === 'ANY' ? getFamilyCacheEntry(normalized, gluePolicy, scope, type) : null;
+            return entry && !entry.failed ? entry : null;
+        });
         const reusedEntries = cachedEntries.every(Boolean) ? [] : cachedEntries.filter(Boolean);
         const qTypes = families.filter((type, index) => !reusedEntries.includes(cachedEntries[index]));
         const results = await Promise.all(qTypes.map(qType =>
@@ -1642,6 +1655,7 @@ async function resolveNameserverAddresses(normalized, dependencies, family) {
             ? cachedEntries[index].ips
             : recordsByType[qTypes.indexOf(type)]);
         const allowedIps = filterAllowedAddresses(ips, dependencies);
+        const isConclusive = results.every(result => result.complete) && !dependencies.signal?.aborted;
         if (ips.length > 0) {
             // 片方のアドレス種別が予算で打ち切られた結果を、完全な NS アドレス一覧として保存しない。
             if (queryBudget?.exhausted) {
@@ -1653,31 +1667,27 @@ async function resolveNameserverAddresses(normalized, dependencies, family) {
                 ...results.map(result => result.ttlSeconds).filter(ttl => ttl !== null).map(ttl => ttl * 1000),
                 ...reusedEntries.map(entry => entry.expiresAt - Date.now())
             );
-            // 権威応答で確定した種別だけを保存する。一時的な失敗で空になった種別は保存せず、次回に再解決させる
+            // 権威応答で確定した種別だけを保存する。一時的な失敗で空になった種別は保存せず、次回に再解決させる。
+            // ただし使えるアドレスが 1 つも無い場合は、失敗した種別も短時間記録して再解決の繰り返しを防ぐ
             results.forEach((result, index) => {
                 if (result.definitive) {
                     cacheFamilyIPs(normalized, qTypes[index], recordsByType[index], ttlMs, gluePolicy, scope);
+                } else if (isConclusive && allowedIps.length === 0) {
+                    cacheFamilyFailure(normalized, qTypes[index], gluePolicy, scope);
                 }
             });
-            if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
-                if (allowedIps.length === 0) {
-                    cacheNegativeResult(normalized, gluePolicy, scope, family, ttlMs);
-                }
-                const allowedSet = new Set(allowedIps);
-                recordsByType.forEach((records, index) => {
-                    if (records.length === 0 || records.some(ip => allowedSet.has(ip))) return;
-                    const ttlSeconds = results[index].ttlSeconds;
-                    const familyTtlMs = ttlSeconds === null
-                        ? NAMESERVER_IP_CACHE_TTL
-                        : Math.min(ttlSeconds * 1000, NAMESERVER_IP_CACHE_TTL);
-                    cacheNegativeResult(normalized, gluePolicy, scope, qTypes[index], familyTtlMs);
-                });
-            }
             return includeBlockedAddresses ? ips : (allowedIps.length > 0 ? allowedIps : null);
         }
         // 上限や中断で打ち切られた失敗は経路依存のためキャッシュせず、確定的な失敗のみ短時間キャッシュする
-        if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
-            cacheNegativeResult(normalized, gluePolicy, scope, family);
+        if (isConclusive) {
+            results.forEach((result, index) => {
+                if (result.definitive) {
+                    // 権威応答で不在が確定した種別 (NODATA / NXDOMAIN)
+                    cacheFamilyIPs(normalized, qTypes[index], [], NAMESERVER_NEGATIVE_CACHE_TTL, gluePolicy, scope);
+                } else {
+                    cacheFamilyFailure(normalized, qTypes[index], gluePolicy, scope);
+                }
+            });
         }
         return null;
     })();
