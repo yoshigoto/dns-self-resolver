@@ -509,6 +509,14 @@ export function queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType = 'NS
                 finish(socketError);
             });
 
+            // 応答を返さずに切断された場合は、タイムアウトまで待たずに失敗を確定させる
+            socket.on('close', () => {
+                if (settled) return;
+                const closedError = buildDnsError('SOCKET_ERROR', { domain, serverIp, qType, transport: 'tcp', detail: 'Connection closed before a complete response was received', retryable: true });
+                setCacheEntry(dnsResponseCache, cacheKey, closedError, DNS_CACHE_TTL.transient);
+                finish(closedError);
+            });
+
             let receivedData = Buffer.alloc(0);
             let totalReceivedBytes = 0;
             socket.on('data', (chunk) => {
@@ -911,10 +919,17 @@ export const RESOLUTION_LIMITS = Object.freeze({
     // 1 つの referral から試行するアドレス付き候補の上限
     maxCandidatesPerReferral: 20,
     // glue なし NS 名の入れ子解決の深さ上限
-    maxNsResolutionDepth: 5
+    maxNsResolutionDepth: 5,
+    // 1 つの名前についてルートから辿る referral の段数上限
+    maxReferralDepth: 16,
+    // 1 回の解決で追跡する CNAME の段数上限
+    maxCnameChain: 8
 });
 
-const nameserverIpCache = new Map(); // スコープ・正規化ホスト名・gluePolicy -> { ips, expiresAt }
+// スコープ・正規化ホスト名・gluePolicy・アドレス種別 (A / AAAA) -> { ips, expiresAt }
+// 種別ごとに保持し、片方しか解決していない結果を完全な一覧として返さないようにする (ips は空配列もあり得る)
+const nameserverIpCache = new Map();
+const ADDRESS_FAMILIES = ['A', 'AAAA'];
 const nameserverNegativeCache = new Map(); // スコープ・正規化ホスト名・gluePolicy・family -> { expiresAt }
 const inFlightServerResolutions = new Map(); // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
 const inFlightIpv4Resolutions = new Map();   // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
@@ -993,9 +1008,33 @@ function getUnexpiredEntry(map, key) {
     return entry;
 }
 
+function getNameserverFamilyKey(hostname, gluePolicy, scope, family) {
+    return `${getNameserverResolutionKey(hostname, gluePolicy, scope)}|${family}`;
+}
+
+// 指定した種別がすべてキャッシュ済みの場合だけ、それらを合わせたアドレス一覧を返す
+function getCachedFamilyIPs(hostname, gluePolicy, scope, families) {
+    const ips = [];
+    for (const family of families) {
+        const entry = getUnexpiredEntry(nameserverIpCache, getNameserverFamilyKey(hostname, gluePolicy, scope, family));
+        if (!entry) return null;
+        ips.push(...entry.ips);
+    }
+    return ips;
+}
+
+function cacheFamilyIPs(hostname, family, ips, ttlMs, gluePolicy, scope) {
+    if (!(ttlMs > 0)) return;
+    setBounded(
+        nameserverIpCache,
+        getNameserverFamilyKey(hostname, gluePolicy, scope, family),
+        { ips, expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
+        NAMESERVER_CACHE_MAX_ENTRIES
+    );
+}
+
 export function getCachedNameserverIPs(hostname, gluePolicy = 'strict', dependencies = {}) {
-    const key = getNameserverResolutionKey(hostname, gluePolicy, getCacheScope(dependencies));
-    const ips = getUnexpiredEntry(nameserverIpCache, key)?.ips;
+    const ips = getCachedFamilyIPs(hostname, gluePolicy, getCacheScope(dependencies), ADDRESS_FAMILIES);
     if (!ips) return null;
     const selected = dependencies.includeBlockedAddresses === true
         ? ips : filterAllowedAddresses(ips, dependencies);
@@ -1012,12 +1051,12 @@ export function cacheNameserverIPs(
     if (!hostname || !Array.isArray(ips)) return;
     const validIps = ips.filter(isIpLiteral);
     if (validIps.length === 0 || !(ttlMs > 0)) return;
-    setBounded(
-        nameserverIpCache,
-        getNameserverResolutionKey(hostname, gluePolicy, getCacheScope(dependencies)),
-        { ips: validIps, expiresAt: Date.now() + Math.min(ttlMs, NAMESERVER_IP_CACHE_TTL) },
-        NAMESERVER_CACHE_MAX_ENTRIES
-    );
+    // 渡された一覧を A / AAAA 両方の完全な結果として扱う
+    const scope = getCacheScope(dependencies);
+    for (const family of ADDRESS_FAMILIES) {
+        const familyIps = validIps.filter(ip => isIPv6(ip) === (family === 'AAAA'));
+        cacheFamilyIPs(hostname, family, familyIps, ttlMs, gluePolicy, scope);
+    }
 }
 
 function getNegativeCacheKey(hostname, gluePolicy, scope, family) {
@@ -1142,8 +1181,11 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         }
     };
     const isAborted = () => queryOptions.signal?.aborted === true;
-    const done = (records) => ({
+    // definitive: 権威サーバーの応答で確定した結果 (レコードあり、または NODATA/NXDOMAIN)。
+    // 到達不能・上限・中断などで得られなかった空の結果と区別する
+    const done = (records, definitive = false) => ({
         records,
+        definitive,
         ttlSeconds: minTtl,
         complete: !isAborted() && budget.limitHits === limitHitsAtStart
     });
@@ -1187,19 +1229,20 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         return false;
     };
 
-    let depth = 0;
-    while (depth < 10) {
+    // 問い合わせ総数は resolutionBudget で制限し、ここでは名前ごとの referral 段数と CNAME 段数を制限する
+    let referralDepth = 0;
+    let cnameCount = 0;
+    while (true) {
         if (isAborted()) return done([]);
         if (getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions)) {
             if (await useNextCandidate()) continue;
             return done([]);
         }
         if (!consumeResolutionBudget(budget)) return done([]);
-        depth++;
 
-        let res = getBlockedAddressError(queryName, currentServerIp, qType, 'udp', queryOptions);
+        let res;
         try {
-            res ||= await queryUDP(queryName, currentServerIp, cache, qType, queryOptions);
+            res = await queryUDP(queryName, currentServerIp, cache, qType, queryOptions);
         } catch (e) {
             res = { error: 'QUERY_EXCEPTION', detail: e?.message };
         }
@@ -1217,7 +1260,7 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             .filter(record => record.type === qType && normalizeDnsName(record.name) === queryName);
         if (matchedAnswers.length > 0) {
             matchedAnswers.forEach(trackTtl);
-            return done(matchedAnswers.map(record => record.data));
+            return done(matchedAnswers.map(record => record.data), true);
         }
 
         const cname = (res.answers || []).find(record =>
@@ -1225,8 +1268,13 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         if (cname) {
             const cnameTarget = normalizeDnsName(cname.data);
             if (!cnameTarget || visitedNames.has(cnameTarget)) return done([]);
+            if (++cnameCount > limits.maxCnameChain) {
+                budget.limitHits++;
+                return done([]);
+            }
             trackTtl(cname);
             visitedNames.add(cnameTarget);
+            referralDepth = 0;
             queryName = cnameTarget;
             currentServerIp = ROOT_SERVER_BOOTSTRAP_IP;
             currentServerZone = '.';
@@ -1234,10 +1282,14 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             continue;
         }
 
-        const AUTHORITATIVE_ANSWER = dnsPacket.AUTHORITATIVE_ANSWER || 1024;
-        const isAuthoritative = (res.flags & AUTHORITATIVE_ANSWER) !== 0;
-        if (isAuthoritative) {
-            return done([]); // 権威応答だが対象レコードが無い (NODATA/NXDOMAIN)
+        // AA 付きでも REFUSED / SERVFAIL などのエラー応答は不在の証明にならないため、次の候補を試す
+        const isErrorRcode = res.rcode !== undefined && res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
+        if (isErrorRcode) {
+            if (await useNextCandidate()) continue;
+            return done([]);
+        }
+        if ((res.flags & dnsPacket.AUTHORITATIVE_ANSWER) !== 0) {
+            return done([], true); // 権威応答だが対象レコードが無い (NODATA/NXDOMAIN)
         }
 
         const allNsRecords = (res.authorities || []).filter(r => r.type === 'NS');
@@ -1247,6 +1299,10 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
             return done([]);
         }
         const nsRecords = allNsRecords.filter(r => normalizeDnsName(r.name) === delegatedZone);
+        if (++referralDepth > limits.maxReferralDepth) {
+            budget.limitHits++;
+            return done([]);
+        }
 
         const nsNames = [...new Set(nsRecords.map(r => normalizeDnsName(r.data)).filter(Boolean))];
         const referralAddressByNsName = new Map();
@@ -1292,9 +1348,6 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         if (await useNextCandidate()) continue;
         return done([]);
     }
-
-    budget.limitHits++;
-    return done([]);
 }
 
 // ルートサーバーから委任を辿って name の qType レコードを自己解決する (フルサービスリゾルバのキャッシュを経由しない)。
@@ -1409,7 +1462,12 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
             const ttlMs = ttls.length > 0
                 ? Math.min(Math.min(...ttls) * 1000, NAMESERVER_IP_CACHE_TTL)
                 : NAMESERVER_IP_CACHE_TTL;
-            cacheNameserverIPs(normalized, ips, ttlMs, gluePolicy, scope);
+            // 権威応答で確定した種別だけを保存する。一時的な失敗で空になった種別は保存せず、次回に再解決させる
+            results.forEach((result, index) => {
+                if (result.definitive) {
+                    cacheFamilyIPs(normalized, qTypes[index], recordsByType[index], ttlMs, gluePolicy, scope);
+                }
+            });
             if (results.every(result => result.complete) && !dependencies.signal?.aborted) {
                 if (allowedIps.length === 0) {
                     cacheNegativeResult(normalized, gluePolicy, scope, family, ttlMs);
@@ -1453,8 +1511,8 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const allowedKnown = filterAllowedAddresses(known || [], dependencies);
     if (allowedKnown.length > 0) return allowedKnown[0];
 
-    const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const cachedV4 = filterAllowedAddresses(cached || [], dependencies).find(ip => !isIPv6(ip));
+    const cached = getCachedFamilyIPs(normalized, gluePolicy, getCacheScope(dependencies), ['A']);
+    const cachedV4 = filterAllowedAddresses(cached || [], dependencies)[0];
     if (cachedV4) return cachedV4;
 
     const ips = await resolveNameserverAddresses(normalized, dependencies, 'A', inFlightIpv4Resolutions);
@@ -1473,8 +1531,8 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const allowedKnown = filterAllowedAddresses(known || [], dependencies);
     if (allowedKnown.length > 0) return allowedKnown[0];
 
-    const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const cachedV6 = filterAllowedAddresses(cached || [], dependencies).find(ip => isIPv6(ip));
+    const cached = getCachedFamilyIPs(normalized, gluePolicy, getCacheScope(dependencies), ['AAAA']);
+    const cachedV6 = filterAllowedAddresses(cached || [], dependencies)[0];
     if (cachedV6) return cachedV6;
 
     const ips = await resolveNameserverAddresses(normalized, dependencies, 'AAAA', inFlightIpv6Resolutions);

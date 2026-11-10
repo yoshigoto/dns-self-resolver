@@ -206,7 +206,7 @@ const addresses = await resolveServerIPs('ns.example.com', {
 }
 ```
 
-`error` には `TIMEOUT`、`ABORTED`、`QUERY_LIMIT_EXCEEDED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。
+`error` には `TIMEOUT`、`ABORTED`、`QUERY_LIMIT_EXCEEDED`、`SOCKET_ERROR`、`SEND_ERROR`、`DECODE_ERROR` などが入ります。`serverIp` が IP アドレスリテラルでない場合やポートが範囲外の場合は、ソケットを作成せず `SEND_ERROR`（`retryable: false`）を返します。TCP で応答を受け取る前に接続が閉じられた場合は、タイムアウトを待たずに `SOCKET_ERROR`（`retryable: true`）を返します。
 
 UDP では、不正なデータグラムを受け取っても問い合わせを打ち切らず、正しい応答を待ちます。送信元・トランザクション ID・QR ビットの検証を通過した応答でデコードに失敗し、その後も正しい応答が届かずタイムアウトした場合は `DECODE_ERROR` を返します（大文字・小文字の不一致による 0x20 なし再試行の条件も満たす場合は、再試行を優先します）。送信元や ID が一致しない応答だけを受け取った場合は `TIMEOUT` を返します。UDP から TCP へのフォールバック自体が例外で失敗した場合は `TCP_FALLBACK_ERROR` を返します。このエラー形式には `retryFrom: 'udp-truncated'` と `isFallback: true` が含まれます。
 
@@ -218,6 +218,8 @@ UDP では、不正なデータグラムを受け取っても問い合わせを�
 - タイムアウトは既定 2 秒、その他の一時的な失敗も短時間キャッシュします。失敗を長時間固定しないよう、無期限にはキャッシュしません。
 - キャッシュキーは問い合わせ先、名前、レコード種別、ポート、EDNS / DO の設定、タイムアウトごとに分かれます。
 - UDP の同一問い合わせが応答待ちの間に重複した場合は 1 回にまとめます。別々の `Map` を渡した呼び出し元にも、結果をそれぞれのキャッシュへ反映します。
+
+ネームサーバー IP のキャッシュは A と AAAA を別々に保持し、権威応答で確定した種別（レコードなしを含む）だけを保存します。`resolveServerIPs` は両方がキャッシュ済みの場合にだけキャッシュを使うため、片方しか解決していない結果や、一時的な失敗で片方が欠けた結果を完全な一覧として返しません。
 
 ネームサーバー IP のキャッシュは、レコード TTL と `NAMESERVER_IP_CACHE_TTL`（既定 5 分）の小さい方を使います。失敗した名前は `NAMESERVER_NEGATIVE_CACHE_TTL`（既定 5 秒）だけネガティブキャッシュします。キャッシュと並行解決の共有範囲は、glue 方針や `knownAddresses`、差し替えた解決関数、DNS ポートなどに応じて分離されます。
 
@@ -233,6 +235,8 @@ NXNS 型の増幅や過剰なリソース消費を抑える上限があります
 | `maxGluelessNsPerReferral` | 5 | 1 つの referral で自己解決を試す、glue のない NS 名の数。 |
 | `maxCandidatesPerReferral` | 20 | 1 つの referral で試す、アドレス付き候補の数。 |
 | `maxNsResolutionDepth` | 5 | glue のない NS 名を入れ子で解決する深さ。 |
+| `maxReferralDepth` | 16 | 1 つの名前についてルートからたどる referral の段数。CNAME をたどるたびに数え直します。 |
+| `maxCnameChain` | 8 | 1 回の解決でたどる CNAME の段数。 |
 
 ```js
 const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
@@ -252,6 +256,7 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 - 不正な transaction ID や質問内容を持つ応答は無視します。質問セクションが省略された応答を受け入れるのは、ID が一致する FORMERR の場合だけです。
 - `strict` では委任に関係しない out-of-bailiwick glue を候補にしません。受け入れた referral の glue は解決候補として使いますが、ネームサーバー IP キャッシュへ独立した解決結果として登録するわけではありません。
 - 上向き・横向きの referral は受け入れず、次の候補サーバーを試します。
+- AA ビット付きでも `NOERROR` / `NXDOMAIN` 以外の応答（`REFUSED`、`SERVFAIL` など）は不在の確定として扱わず、次の候補サーバーを試します。
 
 このライブラリは DNSSEC 検証を行いません。ランダム化や応答検証は偽装の難易度を上げますが、応答の真正性を暗号学的に確認するには、呼び出し側で DNSSEC 検証が必要です。`retryWithoutEdns: true` が付いた応答は EDNS / DO なしで再取得したものです。DNSSEC 検証を行う呼び出し側は、偽装された FORMERR によるダウングレードの可能性を考慮し、署名の欠如を単なる insecure として扱わないでください。
 
