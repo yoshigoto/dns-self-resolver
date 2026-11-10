@@ -2006,10 +2006,10 @@ test('UDP queries with different options are not coalesced', async () => {
 
     try {
         await Promise.all([
-            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: false }),
-            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: true, dnssecOk: true }),
-            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'A', { useEdns: false }),
-            queryDirectlyUDP('options-split.example.test', '192.0.2.2', new Map(), 'NS', { useEdns: false })
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: false, udpTries: 1 }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'NS', { useEdns: true, dnssecOk: true, udpTries: 1 }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.1', new Map(), 'A', { useEdns: false, udpTries: 1 }),
+            queryDirectlyUDP('options-split.example.test', '192.0.2.2', new Map(), 'NS', { useEdns: false, udpTries: 1 })
         ]);
         assert.equal(sent, 4);
     } finally {
