@@ -214,11 +214,37 @@ function setBounded(map, key, entry, maxEntries) {
     map.set(key, entry);
 }
 
+// エントリ数の上限を指定した応答キャッシュ (Map) を作る。通常の Map を渡した場合は既定の上限を使う
+export function createDnsResponseCache(maxEntries = DNS_RESPONSE_CACHE_MAX_ENTRIES) {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
+        throw new TypeError('maxEntries must be a positive safe integer');
+    }
+    const cache = new Map();
+    cache.maxEntries = maxEntries;
+    return cache;
+}
+
+function getCacheMaxEntries(dnsResponseCache) {
+    const maxEntries = dnsResponseCache?.maxEntries;
+    return Number.isSafeInteger(maxEntries) && maxEntries > 0 ? maxEntries : DNS_RESPONSE_CACHE_MAX_ENTRIES;
+}
+
 export function setCacheEntry(dnsResponseCache, cacheKey, value, ttlMs = DNS_CACHE_TTL.success) {
     setBounded(dnsResponseCache, cacheKey, {
         value,
         expiresAt: Date.now() + ttlMs
-    }, DNS_RESPONSE_CACHE_MAX_ENTRIES);
+    }, getCacheMaxEntries(dnsResponseCache));
+}
+
+// 再試行・フォールバック先がキャッシュした結果を、経路情報を付けて元の問い合わせのキーに保存する。
+// キャッシュから復元した結果でも、最初に取得したときの経路 (TCP フォールバックなど) が分かるようにするため
+function shareCachedResult(dnsResponseCache, sourceKey, targetKey, annotations) {
+    const entry = dnsResponseCache.get(sourceKey);
+    if (!entry || entry.expiresAt <= Date.now()) return;
+    setBounded(dnsResponseCache, targetKey, {
+        value: { ...entry.value, ...annotations },
+        expiresAt: entry.expiresAt
+    }, getCacheMaxEntries(dnsResponseCache));
 }
 
 function normalizeQueryOptions(options, defaults = {}) {
@@ -668,7 +694,7 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
             // 合流した呼び出し元が別のキャッシュを使っている場合も、問い合わせ結果のキャッシュを反映する
             if (dnsResponseCache && dnsResponseCache !== flight.cache) {
                 const entry = flight.cache?.get?.(cacheKey);
-                if (entry) setBounded(dnsResponseCache, cacheKey, { ...entry }, DNS_RESPONSE_CACHE_MAX_ENTRIES);
+                if (entry) setBounded(dnsResponseCache, cacheKey, { ...entry }, getCacheMaxEntries(dnsResponseCache));
             }
             resolve({ ...result });
         });
@@ -750,7 +776,11 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 return handOff(queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType, {
                     ...options,
                     use0x20: false
-                }).then(result => ({ ...result, caseRandomizationFallback: true })));
+                }).then((result) => {
+                    const annotations = { caseRandomizationFallback: true };
+                    shareCachedResult(dnsResponseCache, cacheKey, cacheKey, annotations);
+                    return { ...result, ...annotations };
+                }));
             }
             if (lastDecodeError !== null) {
                 const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'udp', detail: lastDecodeError, retryable: false });
@@ -797,23 +827,25 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                 decoded = restoreQueryNameCase(decoded, sentName, domain);
 
                 if (decoded.rcode === 'FORMERR' && options.useEdns) {
-                    return handOff(queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType, {
-                        ...options,
-                        useEdns: false,
-                        dnssecOk: false
-                    }).then(result => ({ ...result, retryWithoutEdns: true })));
+                    const retryOptions = { ...options, useEdns: false, dnssecOk: false };
+                    return handOff(queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType, retryOptions)
+                        .then((result) => {
+                            const annotations = { retryWithoutEdns: true };
+                            shareCachedResult(dnsResponseCache,
+                                getDnsCacheKey(serverIp, qType, domain, retryOptions), cacheKey, annotations);
+                            return { ...result, ...annotations };
+                        }));
                 }
 
                 const isTruncated = (decoded.flags & dnsPacket.TRUNCATED_RESPONSE) !== 0;
                 if (isTruncated) {
                     return handOff(queryDirectlyTCP(domain, serverIp, dnsResponseCache, qType, options)
                         .then(
-                            tcpResult => ({
-                                ...tcpResult,
-                                transport: tcpResult?.transport || 'tcp',
-                                retryFrom: 'udp-truncated',
-                                isFallback: true
-                            }),
+                            (tcpResult) => {
+                                const annotations = { retryFrom: 'udp-truncated', isFallback: true };
+                                shareCachedResult(dnsResponseCache, cacheKey, cacheKey, annotations);
+                                return { ...tcpResult, transport: tcpResult?.transport || 'tcp', ...annotations };
+                            },
                             err => ({
                                 error: 'TCP_FALLBACK_ERROR',
                                 detail: err?.message || 'TCP fallback failed',
@@ -824,11 +856,12 @@ function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
                         ));
                 }
 
+                const udpSuccess = { ...decoded, transport: 'udp' };
                 if (decoded.rcode === 'NOERROR') {
-                    setCacheEntry(dnsResponseCache, cacheKey, decoded, computeSuccessTtlMs(decoded));
+                    setCacheEntry(dnsResponseCache, cacheKey, udpSuccess, computeSuccessTtlMs(decoded));
                 }
 
-                return finish({ ...decoded, transport: 'udp' });
+                return finish(udpSuccess);
             } catch (e) {
                 const decodeError = buildDnsError('DECODE_ERROR', { domain, serverIp, qType, transport: 'udp', detail: e.message, retryable: false });
                 setCacheEntry(dnsResponseCache, cacheKey, decodeError, DNS_CACHE_TTL.transient);
@@ -1011,13 +1044,24 @@ function getCacheScope(dependencies) {
     const rootServers = getRootServerOverride(dependencies);
     const portScope = `udp:${queryOptions.udpPort ?? DNS_PORT},tcp:${queryOptions.tcpPort ?? DNS_PORT}` +
         (rootServers ? `|roots:${rootServers.join(',')}` : '');
+    const { cacheScope } = dependencies;
+    if (cacheScope !== undefined && (typeof cacheScope !== 'string' || cacheScope === '')) {
+        throw new TypeError('cacheScope must be a non-empty string');
+    }
+    // 問い合わせ・解決関数を差し替える場合、既定では関数の同一性でキャッシュを分ける。
+    // 呼び出しごとに作り直すラッパー関数でもキャッシュを共有できるよう、cacheScope で明示的に名前を付けられる
+    const transportScope = cacheScope !== undefined
+        ? [`named:${encodeURIComponent(cacheScope)}`]
+        : [
+            dependencies.queryDirectlyUDP,
+            dependencies.resolveHostnameIPv4Self,
+            dependencies.resolveHostnameIPv6Self
+        ].map(getIdentity);
     const parts = [
-        dependencies.knownAddresses,
-        dependencies.queryDirectlyUDP,
-        dependencies.resolveHostnameIPv4Self,
-        dependencies.resolveHostnameIPv6Self,
-        dependencies.isAllowedServerIP || queryOptions.isAllowedServerIP
-    ].map(getIdentity);
+        getIdentity(dependencies.knownAddresses),
+        ...transportScope,
+        getIdentity(dependencies.isAllowedServerIP || queryOptions.isAllowedServerIP)
+    ];
     return `${parts.every(part => part === '-') ? 'default' : `scope:${parts.join(',')}`}|${portScope}`;
 }
 
