@@ -242,10 +242,29 @@ UDP では、不正なデータグラムを受け取っても問い合わせを�
 - タイムアウトは既定 2 秒、その他の一時的な失敗も短時間キャッシュします。失敗を長時間固定しないよう、無期限にはキャッシュしません。
 - キャッシュキーは問い合わせ先、名前、レコード種別、ポート、EDNS / DO の設定、タイムアウトごとに分かれます。
 - UDP の同一問い合わせが応答待ちの間に重複した場合は 1 回にまとめます。別々の `Map` を渡した呼び出し元にも、結果をそれぞれのキャッシュへ反映します。
+- キャッシュから復元した結果（`isCached: true`）の `transport`、`retryFrom` / `isFallback`、`retryWithoutEdns`、`caseRandomizationFallback` は、その応答を最初に取得したときの経路を表します。EDNS なしの再試行で得た結果は元の問い合わせのキーにも保存するため、同じ問い合わせで FORMERR を受け直すことはありません。
+
+エントリ数の上限は既定で `DNS_RESPONSE_CACHE_MAX_ENTRIES`（10,000 件）です。変更する場合は `createDnsResponseCache(maxEntries)` で作ったキャッシュを渡してください。
+
+```js
+import { createDnsResponseCache, queryDirectlyUDP } from 'dns-self-resolver';
+
+const cache = createDnsResponseCache(20000);
+const response = await queryDirectlyUDP('example.com', '198.41.0.4', cache, 'NS');
+```
 
 ネームサーバー IP のキャッシュは A と AAAA を別々に保持し、権威応答で確定した種別（レコードなしを含む）だけを保存します。`resolveServerIPs` は両方がキャッシュ済みの場合にだけキャッシュを使うため、片方しか解決していない結果や、一時的な失敗で片方が欠けた結果を完全な一覧として返しません。
 
 ネームサーバー IP のキャッシュは、レコード TTL と `NAMESERVER_IP_CACHE_TTL`（既定 5 分）の小さい方を使います。失敗した名前は `NAMESERVER_NEGATIVE_CACHE_TTL`（既定 5 秒）だけネガティブキャッシュします。キャッシュと並行解決の共有範囲は、glue 方針や `knownAddresses`、差し替えた解決関数、DNS ポートなどに応じて分離されます。
+
+`dependencies.queryDirectlyUDP` などの関数を差し替えた場合、キャッシュは関数の同一性ごとに分かれます。呼び出しのたびに作り直すラッパー関数を渡すと、毎回別のキャッシュになり共有されません。同じ通信経路を包むラッパーでキャッシュを共有するには、`dependencies.cacheScope` に空でない文字列を指定してください。同じ `cacheScope` の呼び出しは、差し替えた関数が別のオブジェクトでもネームサーバー IP キャッシュと並行解決を共有します（`knownAddresses`、宛先ポリシー、ポート、ルートサーバー指定による分離は維持します）。応答内容が異なる関数に同じ `cacheScope` を付けないでください。
+
+```js
+const addresses = await resolveServerIPs('ns.example.com', {
+  queryDirectlyUDP: (...args) => queryDirectlyUDP(...args), // 呼び出しごとに作るラッパー
+  cacheScope: 'my-app'
+});
+```
 
 `DNS_CACHE_TTL`、`getCacheEntry`、`setCacheEntry` は DNS 応答キャッシュ用の定数・関数です。ネームサーバー IP キャッシュを扱う `getCachedNameserverIPs` / `cacheNameserverIPs` も利用できます。
 
@@ -270,7 +289,7 @@ const addresses = await resolveRecordFromRoot('example.com', 'A', cache, {
 
 この既存の探索量制限は維持しています。実際の送信回数を制限する `queryBudget` とは別の上限です。
 
-問い合わせ応答キャッシュとネームサーバー IP キャッシュには、それぞれエントリ数の上限（既定 10,000 件）があり、上限を超えると古いエントリから削除します。TCP 応答の受信量にも上限があります。
+問い合わせ応答キャッシュとネームサーバー IP キャッシュには、それぞれエントリ数の上限（既定 10,000 件。応答キャッシュは `createDnsResponseCache` で変更可能）があり、上限を超えると古いエントリから削除します。TCP 応答の受信量にも上限があります。
 
 ## セキュリティ上の注意
 
