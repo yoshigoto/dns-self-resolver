@@ -206,7 +206,7 @@ export const DNS_RESPONSE_CACHE_MAX_ENTRIES = 10000;
 // 上限を超える場合は最も古く挿入されたエントリから追い出す (Map の挿入順を利用)
 function setBounded(map, key, entry, maxEntries) {
     if (map.has(key)) map.delete(key);
-    while (map.size >= maxEntries && typeof map.keys === 'function') {
+    while (map.size >= maxEntries) {
         const oldestKey = map.keys().next().value;
         if (oldestKey === undefined) break;
         map.delete(oldestKey);
@@ -675,23 +675,10 @@ export function queryDirectlyUDP(domain, serverIp, dnsResponseCache, qType = 'NS
     });
 }
 
+// 中断・宛先・ポート・キャッシュの確認は、唯一の呼び出し元である queryDirectlyUDP が同期的に済ませている
 function performUdpQuery(domain, serverIp, dnsResponseCache, qType, options) {
     return new Promise((resolve) => {
-        if (options.signal?.aborted) {
-            return resolve(buildAbortError({ domain, serverIp, qType, transport: 'udp', signal: options.signal }));
-        }
-        if (!isIpLiteral(serverIp)) {
-            return resolve(buildInvalidServerError(domain, serverIp, qType, 'udp'));
-        }
-        const blocked = getBlockedAddressError(domain, serverIp, qType, 'udp', options);
-        if (blocked) return resolve(blocked);
-
         const cacheKey = getDnsCacheKey(serverIp, qType, domain, options);
-        const cachedResult = getCacheEntry(dnsResponseCache, cacheKey);
-        // 以前に同じサーバー・タイプ・ドメインに対して問い合わせ済みなら、即時復元
-        if (cachedResult) {
-            return resolve({ ...cachedResult, isCached: true });
-        }
         const queryLimit = getQueryLimitError(domain, serverIp, qType, 'udp', options);
         if (queryLimit) return resolve(queryLimit);
 
@@ -1003,9 +990,8 @@ export const RESOLUTION_LIMITS = Object.freeze({
 const nameserverIpCache = new Map();
 const ADDRESS_FAMILIES = ['A', 'AAAA'];
 const nameserverNegativeCache = new Map(); // スコープ・正規化ホスト名・gluePolicy・family -> { expiresAt }
-const inFlightServerResolutions = new Map(); // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
-const inFlightIpv4Resolutions = new Map();   // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
-const inFlightIpv6Resolutions = new Map();   // 同一ホスト名・ポリシーの並行解決合流用 (Singleflight)
+// 同一ホスト名・ポリシー・アドレス種別 (A / AAAA / ANY) の並行解決合流用 (Singleflight)
+const inFlightNameserverResolutions = new Map();
 
 // 結果に影響する呼び出し側固有の差し替え (knownAddresses やクエリ関数) ごとにキャッシュを分離し、
 // ある呼び出し元が持ち込んだアドレスが別の呼び出し元の解決結果を汚染しないようにする
@@ -1501,7 +1487,7 @@ export async function resolveDnsServerAddress(
 
 // NS 名のアドレス解決の共通処理 (循環・深さ上限・ネガティブキャッシュ・Singleflight・TTL に基づくキャッシュ)。
 // family: 'A' | 'AAAA' | 'ANY'。成功時は IP の配列、失敗時は null を返す。
-async function resolveNameserverAddresses(normalized, dependencies, family, inFlightMap) {
+async function resolveNameserverAddresses(normalized, dependencies, family) {
     const gluePolicy = dependencies.gluePolicy || 'strict';
     const scope = getCacheScope(dependencies);
     const limits = getResolutionLimits(dependencies);
@@ -1521,8 +1507,8 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
     const queryBudget = dependencies.queryBudget ?? dependencies.queryOptions?.queryBudget;
     const resolutionKey = `${getNameserverResolutionKey(normalized, gluePolicy, scope)}|${family}|includeBlocked:${includeBlockedAddresses ? 1 : 0}|budget:${getIdentity(queryBudget)}`;
     const shareInFlight = !dependencies.signal && !dependencies.queryOptions?.signal;
-    if (shareInFlight && inFlightMap.has(resolutionKey)) {
-        const shared = await inFlightMap.get(resolutionKey);
+    if (shareInFlight && inFlightNameserverResolutions.has(resolutionKey)) {
+        const shared = await inFlightNameserverResolutions.get(resolutionKey);
         // 合流先の失敗は別の解決経路の上限による打ち切りかもしれないため、呼び出し側でキャッシュさせない
         if (!shared) markLimitHit(dependencies);
         return shared;
@@ -1592,11 +1578,11 @@ async function resolveNameserverAddresses(normalized, dependencies, family, inFl
         return null;
     })();
 
-    if (shareInFlight) inFlightMap.set(resolutionKey, promise);
+    if (shareInFlight) inFlightNameserverResolutions.set(resolutionKey, promise);
     try {
         return await promise;
     } finally {
-        if (shareInFlight) inFlightMap.delete(resolutionKey);
+        if (shareInFlight) inFlightNameserverResolutions.delete(resolutionKey);
     }
 }
 
@@ -1616,7 +1602,7 @@ export async function resolveHostnameIPv4Self(hostname, dependencies = {}) {
     const cachedV4 = filterAllowedAddresses(cached || [], dependencies)[0];
     if (cachedV4) return cachedV4;
 
-    const ips = await resolveNameserverAddresses(normalized, dependencies, 'A', inFlightIpv4Resolutions);
+    const ips = await resolveNameserverAddresses(normalized, dependencies, 'A');
     return ips?.find(ip => !isIPv6(ip)) || null;
 }
 
@@ -1636,7 +1622,7 @@ export async function resolveHostnameIPv6Self(hostname, dependencies = {}) {
     const cachedV6 = filterAllowedAddresses(cached || [], dependencies)[0];
     if (cachedV6) return cachedV6;
 
-    const ips = await resolveNameserverAddresses(normalized, dependencies, 'AAAA', inFlightIpv6Resolutions);
+    const ips = await resolveNameserverAddresses(normalized, dependencies, 'AAAA');
     return ips?.find(ip => isIPv6(ip)) || null;
 }
 
@@ -1655,9 +1641,9 @@ export async function resolveServerIPs(nsName, dependencies = {}) {
     const allowedKnown = selectAddresses(known || []);
     if (allowedKnown.length > 0) return allowedKnown;
 
+    // getCachedNameserverIPs は同じ基準で選別済みの一覧 (空なら null) を返す
     const cached = getCachedNameserverIPs(normalized, gluePolicy, dependencies);
-    const allowedCached = selectAddresses(cached || []);
-    if (allowedCached.length > 0) return allowedCached;
+    if (cached) return cached;
 
-    return resolveNameserverAddresses(normalized, dependencies, 'ANY', inFlightServerResolutions);
+    return resolveNameserverAddresses(normalized, dependencies, 'ANY');
 }
