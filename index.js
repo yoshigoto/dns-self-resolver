@@ -936,10 +936,12 @@ function shuffle(items) {
 }
 
 function validateRootServers(rootServers) {
-    if (!Array.isArray(rootServers) || rootServers.length === 0 || !rootServers.every(isIpLiteral)) {
+    // every() は疎配列の空スロットを飛ばすため、密な配列に直してから検証する
+    const list = Array.isArray(rootServers) ? Array.from(rootServers) : [];
+    if (list.length === 0 || !list.every(isIpLiteral)) {
         throw new TypeError('rootServers must be a non-empty array of IPv4/IPv6 address literals');
     }
-    return rootServers;
+    return list;
 }
 
 let defaultRootServers = null;
@@ -947,7 +949,7 @@ let defaultRootServers = null;
 // 組み込みのルートヒントの代わりに使うアドレス一覧をプロセス全体に設定する (独自ルートやテスト用)。
 // 指定した順序のまま試す。null を渡すと組み込みのルートヒントに戻す。
 export function setDefaultRootServers(rootServers) {
-    defaultRootServers = rootServers === null ? null : [...validateRootServers(rootServers)];
+    defaultRootServers = rootServers === null ? null : validateRootServers(rootServers);
 }
 
 function getRootServerOverride(dependencies) {
@@ -1332,8 +1334,9 @@ async function resolveFromRootDetailed(name, qType, dnsResponseCache, dependenci
         }
         const isErrorRcode = !res?.error && res?.rcode !== undefined &&
             res.rcode !== 'NOERROR' && res.rcode !== 'NXDOMAIN';
-        // 宛先拒否など、サーバーの到達性と無関係な失敗では後回しの状態を変えない
-        if (currentServerZone === '.' && res) {
+        // 宛先拒否など、サーバーの到達性と無関係な失敗では後回しの状態を変えない。
+        // キャッシュから復元した結果も今回の到達性の観測ではないため対象外とする
+        if (currentServerZone === '.' && res && res.isCached !== true) {
             if (isErrorRcode || ['TIMEOUT', 'SOCKET_ERROR', 'SEND_ERROR'].includes(res.error)) {
                 recordRootServerResult(currentServerIp, true);
             } else if (!res.error) {

@@ -102,5 +102,45 @@ test('rootServers and setDefaultRootServers replace the hints and keep the given
     assert.deepEqual(await run({ rootServers: ['192.0.2.4'] }), ['192.0.2.4']);
 
     await assert.rejects(run({ rootServers: ['ns.example.test'] }), TypeError);
+    await assert.rejects(run({ rootServers: new Array(1) }), TypeError);
     assert.throws(() => setDefaultRootServers([]), TypeError);
+    assert.throws(() => setDefaultRootServers(new Array(1)), TypeError);
+});
+
+test('cached results do not change the backoff state of a root server', async (t) => {
+    withInterfaces(t, ['192.0.2.10']);
+    const askedBy = async (name, respond) => {
+        const asked = [];
+        await resolveRecordFromRoot(name, 'A', new Map(), {
+            queryDirectlyUDP: async (queryName, serverIp) => {
+                asked.push(serverIp);
+                return respond(queryName, serverIp);
+            }
+        });
+        return asked;
+    };
+    const unrelatedFailure = () => ({ error: 'QUERY_EXCEPTION' });
+
+    // 先頭に選ばれたサーバーを実際の失敗で後回しにした後、キャッシュ済みの成功を返させる
+    let failed = null;
+    await askedBy('cached-seed.test', (name, serverIp) => {
+        failed ??= serverIp;
+        return serverIp === failed ? { error: 'SOCKET_ERROR', retryable: true } : answer(name);
+    });
+    await askedBy('cached-success.test', (name, serverIp) =>
+        serverIp === failed ? { ...answer(name), isCached: true } : unrelatedFailure());
+    // 他のテストで後回しになったサーバーが残り得るため、末尾ではなく先頭に来るかどうかで判定する
+    for (let i = 0; i < 100; i++) {
+        assert.notEqual((await askedBy(`cached-after-success-${i}.test`, unrelatedFailure))[0], failed);
+    }
+
+    // キャッシュ済みのタイムアウトでは、正常なサーバーを後回しにしない
+    const healthy = (await askedBy('cached-pick.test', unrelatedFailure))[0];
+    await askedBy('cached-timeout.test', (name, serverIp) =>
+        serverIp === healthy ? { error: 'TIMEOUT', retryable: true, isCached: true } : unrelatedFailure());
+    const first = new Set();
+    for (let i = 0; i < 100; i++) {
+        first.add((await askedBy(`cached-after-timeout-${i}.test`, unrelatedFailure))[0]);
+    }
+    assert.ok(first.has(healthy));
 });
