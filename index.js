@@ -1212,8 +1212,11 @@ function cacheFamilyIPs(hostname, family, ips, ttlMs, gluePolicy, scope, failed 
     );
 }
 
-// 確定的な解決失敗を短時間だけ記録する (同じ失敗する名前への再問い合わせ増幅を防ぐ)
+// 確定的な解決失敗を短時間だけ記録する (同じ失敗する名前への再問い合わせ増幅を防ぐ)。
+// 並行する別の解決が権威応答で得た結果を先に保存している場合は、それを失敗の記録で上書きしない
 function cacheFamilyFailure(hostname, family, gluePolicy, scope) {
+    const existing = getFamilyCacheEntry(hostname, gluePolicy, scope, family);
+    if (existing && !existing.failed) return;
     cacheFamilyIPs(hostname, family, [], NAMESERVER_NEGATIVE_CACHE_TTL, gluePolicy, scope, true);
 }
 

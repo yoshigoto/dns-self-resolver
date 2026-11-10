@@ -241,3 +241,35 @@ test('a recorded failure of one family is not treated as a complete address list
         ['192.0.2.53', '2001:db8::53']
     );
 });
+
+test('a late failure does not overwrite an address cached by a concurrent successful resolution', async () => {
+    let failing = true;
+    let queries = 0;
+    const dependencies = {
+        rootServers: ['192.0.2.1'],
+        dnsResponseCache: new Map(),
+        queryDirectlyUDP: async (name, ip, cache, qType) => {
+            queries++;
+            if (failing) {
+                await new Promise(resolve => setTimeout(resolve, 30));
+                return { error: 'TIMEOUT', retryable: true };
+            }
+            return {
+                flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                rcode: 'NOERROR',
+                answers: [{ type: qType, name, ttl: 300, data: qType === 'A' ? '192.0.2.53' : '2001:db8::53' }]
+            };
+        }
+    };
+
+    // A / AAAA 両方の解決が遅れて失敗する間に、IPv4 のみの解決が成功する
+    const slowFailure = resolveServerIPs('ns.race.test', dependencies);
+    await new Promise(resolve => setImmediate(resolve));
+    failing = false;
+    assert.equal(await resolveHostnameIPv4Self('ns.race.test', dependencies), '192.0.2.53');
+    assert.equal(await slowFailure, null);
+
+    const queriesAfterRace = queries;
+    assert.equal(await resolveHostnameIPv4Self('ns.race.test', dependencies), '192.0.2.53');
+    assert.equal(queries, queriesAfterRace);
+});
